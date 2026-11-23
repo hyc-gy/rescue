@@ -210,9 +210,8 @@ void rescue_grab_task(void *pvParameters)
         /* 视觉是否新鲜：超时未更新就不采信任何目标信息 */
         uint8_t vision_fresh = Maixcam_IsFresh(GRAB_VISION_TIMEOUT_MS);
         uint8_t target_valid = vision_fresh && my_car.vision_manager.is_valid;
-
         /* 蓝牙手动模式优先：此时状态机完全不碰电机，避免把 A 命令设好的状态覆盖掉 */
-        if (HC05_InManualMode()) {
+        if (bluetooth_work && HC05_InManualMode()) {
             vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(GRAB_TASK_PERIOD_MS));
             continue;
         }
@@ -421,6 +420,8 @@ void rescue_grab_task(void *pvParameters)
         /* --- 夹持确认：只统计确认 ROI 的类别数，连续多帧正确才继续 --- */
         case RESCUE_GRAB_CONFIRM_CARGO:
             motor_set_state(MOTOR_STOP);
+            set_vision_angle(ccr_2_max);
+            my_delay_ms(500);
             grab_posture();                    // 确认期间保持夹紧，避免物品掉落
             Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
             if (vision_fresh && my_car.vision_manager.target_mode == MAIXCAM_MODE_CONFIRM_CARGO &&
@@ -463,6 +464,12 @@ void rescue_grab_task(void *pvParameters)
 
         /* --- 接近投放区：先找到投放区，再闭环靠近 --- */
         case RESCUE_GRAB_APPROACH_ZONE:
+            my_car.pose_manager.finished=0;
+            my_car.angle_manager.target_yaw = 180;
+            my_car.pose_manager.target_x = my_car.pose_manager.x;
+            my_car.pose_manager.target_y = CENTER_Y;
+            motor_set_state(MOTOR_POSITION);
+            while(my_car.pose_manager.finished == 0);
             set_vision_angle(ccr_2_max);
             Set_Vision_Mode(zone_mode_for_type(selected_type));
             if (!vision_fresh || my_car.vision_manager.target_mode != zone_mode_for_type(selected_type)) {

@@ -1,6 +1,5 @@
 #ifndef RESCUE_COMMON_H
 #define RESCUE_COMMON_H
-
 #include "main.h"
 #include "gpio.h"
 #include "tim.h"
@@ -17,6 +16,7 @@
 #define motor_work 1
 #define grab_bolls_work 0//1
 #define rudder_work 1//1
+#define bluetooth_work 1
 #define no_target 0
 #define toward_target 1
 #define disrupt_bolls 2

@@ -318,7 +318,10 @@ void motor_task(void *pvParameters){
         get_encoder();
         pose_update_from_encoders();
         collision_guard_update();
-        HC05_PollCommand();                     // 解析蓝牙命令（A/Z、调参、目标位置）
+        if(bluetooth_work)
+        {
+            HC05_PollCommand();                     // 解析蓝牙命令（A/Z、调参、目标位置）   
+        }
         /* 碰撞恢复期间由 motor_task 独占电机，跳过正常控制 */
         if(++cnt==10)
         {
@@ -399,6 +402,12 @@ void motor_task(void *pvParameters){
             case MOTOR_BACKWARD_little:
                 motor_set_pwm(1,-100);
                 motor_set_pwm(2,-100);
+                break;
+            case MOTOR_FORWARD_FAST:
+                motor_set_pwm(1,700);
+                motor_set_pwm(2,700);
+                //motor_set_pwm(3,200);
+                //motor_set_pwm(4,200);
                 break;
             case MOTOR_FORWARD:
                 motor_set_pwm(1,500);

@@ -11,12 +11,13 @@
 typedef enum {
     MOTOR_STOP,           // 1. 停止模式    
     MOTOR_SEARCH_TARGET,    // 2. 寻目标模式
-    MOTOR_TRACK_TARGET,   // 3. 追踪目标
-    MOTOR_FORWARD,        // 4. 前进
-    MOTOR_BACKWARD,       // 5. 后退
-    MOTOR_BACKWARD_little, // 6. 小幅后退
+    MOTOR_TRACK_TARGET,   // 3. 追踪目标模式
+    MOTOR_FORWARD,        // 4. 前进模式
+    MOTOR_BACKWARD,       // 5. 后退模式
+    MOTOR_BACKWARD_little, // 6. 小幅后退模式   
     MOTOR_POSITION,     // 7. 位置模式
-    MOTOR_BLUETOOTH,    // 8. 蓝牙速度模式：直接跟踪 motor_L0/R0.target
+    MOTOR_FORWARD_FAST, // 8. 快速模式
+    MOTOR_BLUETOOTH,    // 9. 蓝牙速度模式：直接跟踪 motor_L0/R0.target
 } MotorState;
 
 void motor_init(void);

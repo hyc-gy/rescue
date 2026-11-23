@@ -266,7 +266,7 @@ uint8_t HC05_ProcessCommand(const char *cmd)
 
     /* --- 1) A / Z：两个电机目标速度 --- */
     if (((*cmd == 'A') || (*cmd == 'a')) && hc05_cmd_end(cmd + 1)) {
-        motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
+        //motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
         motor_L0.target = HC05_RUN_SPEED;
         motor_R0.target = HC05_RUN_SPEED;
         motor_set_state(MOTOR_BLUETOOTH);   // 进入蓝牙速度模式
@@ -274,7 +274,7 @@ uint8_t HC05_ProcessCommand(const char *cmd)
         return 1;
     }
     if (((*cmd == 'E') || (*cmd == 'e')) && hc05_cmd_end(cmd + 1)) {
-        motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
+        //motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
         motor_L0.target = -HC05_RUN_SPEED;
         motor_R0.target = -HC05_RUN_SPEED;
         motor_set_state(MOTOR_BLUETOOTH);   // 进入蓝牙速度模式
@@ -282,16 +282,25 @@ uint8_t HC05_ProcessCommand(const char *cmd)
         return 1;
     }
     if (((*cmd == 'Z') || (*cmd == 'z')) && hc05_cmd_end(cmd + 1)) {
-        hc05_manual_mode = 0U;              // 交还控制权
-        motor_set_state(MOTOR_STOP);        // 先切断输出，保证立刻停车
+        //motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
         motor_L0.target = 0.0f;
         motor_R0.target = 0.0f;
+        motor_set_state(MOTOR_BLUETOOTH);   // 进入蓝牙速度模式
+        hc05_manual_mode = 1U;              // 让 grab 状态机暂停接管电机
         return 1;
     }
     if (((*cmd == 'C') || (*cmd == 'c')) && hc05_cmd_end(cmd + 1)) {
-        motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
+        //motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
         motor_L0.target = HC05_RUN_SPEED/3;
         motor_R0.target = -HC05_RUN_SPEED/3;
+        motor_set_state(MOTOR_BLUETOOTH);   // 进入蓝牙速度模式
+        hc05_manual_mode = 1U;              // 让 grab 状态机暂停接管电机
+        return 1;
+    }
+    if (((*cmd == 'G') || (*cmd == 'g')) && hc05_cmd_end(cmd + 1)) {
+        //motor_pid_clear();                  // 清掉旧模式残留的 PID 状态，避免切换瞬间抖动
+        motor_L0.target = -HC05_RUN_SPEED/3;
+        motor_R0.target = HC05_RUN_SPEED/3;
         motor_set_state(MOTOR_BLUETOOTH);   // 进入蓝牙速度模式
         hc05_manual_mode = 1U;              // 让 grab 状态机暂停接管电机
         return 1;
@@ -302,6 +311,14 @@ uint8_t HC05_ProcessCommand(const char *cmd)
     }
     if (((*cmd == 'X') || (*cmd == 'x')) && hc05_cmd_end(cmd + 1)) {
         grab_posture();
+        return 1;
+    }
+    if (((*cmd == 'K') || (*cmd == 'k')) && hc05_cmd_end(cmd + 1)) {
+        hc05_manual_mode = 0U;              // 让 grab 状态机接管电机
+        motor_L0.target = 0.0f;
+        motor_R0.target = 0.0f;
+        motor_pid_clear();
+        motor_set_state(MOTOR_STOP);   // 进入蓝牙速度模式
         return 1;
     }
     /* --- 2) (x,y,z)：目标位置 + 目标偏航角 --- */
