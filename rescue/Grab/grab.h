@@ -7,6 +7,14 @@
 #include "motor.h"
 #include "rudder_control.h"
 
+/* 视觉确认的运输内容；普通/核心混运时分别保留数量。 */
+typedef struct {
+    uint8_t normal;
+    uint8_t core;
+    uint8_t patient;
+    uint8_t hazard;
+} CargoCounts;
+
 /* ===== 调参区：下面这些图像坐标阈值和超时时间需要在实车上实测后调整 ===== */
 #define GRAB_TASK_PERIOD_MS             10U     // 任务周期（毫秒）
 #define GRAB_VISION_TIMEOUT_MS          150U    // 视觉数据超过此时间未更新就视为失效
@@ -48,5 +56,8 @@ void rescue_grab_task_create(void);
 void Grab_SetTeam(uint8_t team);
 /* 读取当前已设置的队伍（0 表示尚未设置） */
 uint8_t Grab_GetTeam(void);
+
+/* 最近一次连续多帧通过的运输内容；仅为视觉确认记录，不代表已经送达。 */
+CargoCounts Grab_GetConfirmedCargo(void);
 
 #endif

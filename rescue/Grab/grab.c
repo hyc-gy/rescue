@@ -61,6 +61,39 @@ static uint8_t yaw_full_circle = 0U;                  // 完整圈数
 static uint8_t SEARCH_angle_init = 0U;                // 搜索角度是否已初始化
 static uint8_t lost_mode = 0U;                      // 目标丢失模式
 static uint8_t last_match = 0U;                    // 上一次匹配的目标类型
+static CargoCounts candidate_cargo, previous_cargo, confirmed_cargo;
+
+/* 运输业务规则直接保存在本文件，不依赖导航 count/valid。 */
+typedef enum {
+    CARGO_REJECTED = 0,
+    CARGO_FIRST_NORMAL = 1,
+    CARGO_SINGLE_PATIENT = 2,
+    CARGO_MATERIALS = 3
+} CargoMatch;
+
+static CargoMatch cargo_evaluate(CargoCounts cargo, uint8_t first_delivered)
+{
+    if (cargo.hazard != 0U) {
+        return CARGO_REJECTED;
+    }
+    if (!first_delivered) {
+        return cargo.normal == 1U && cargo.core == 0U && cargo.patient == 0U
+            ? CARGO_FIRST_NORMAL : CARGO_REJECTED;
+    }
+    if (cargo.patient != 0U) {
+        return cargo.patient == 1U && cargo.normal == 0U && cargo.core == 0U
+            ? CARGO_SINGLE_PATIENT : CARGO_REJECTED;
+    }
+    uint16_t materials = (uint16_t)cargo.normal + cargo.core;
+    return materials >= 1U && materials <= 3U ? CARGO_MATERIALS : CARGO_REJECTED;
+}
+
+static uint8_t cargo_counts_equal(CargoCounts a, CargoCounts b)
+{
+    return a.normal == b.normal && a.core == b.core &&
+           a.patient == b.patient && a.hazard == b.hazard;
+}
+
 void calc_circle(float curr_yaw)
 {
     static float yaw_last = 0.0f;
@@ -92,6 +125,8 @@ static void enter_state(RescueGrabState state)
     cargo_confirm_ticks = 0U;
     cargo_error_ticks = 0U;       // 夹持失败计数不能跨状态残留，否则下次确认会被立刻判失败
     last_match = 0U;              // 上一次匹配结果清零，重新开始"连续多帧一致"的判断
+    candidate_cargo = (CargoCounts){0};
+    previous_cargo = (CargoCounts){0};
     confirm_baseline = 0U;        // 投放区数量基线只在 PRECHECK 重新采样
     lost_mode = 0U;               // 目标丢失后的去向由新状态重新决定
     SEARCH_angle_init = 0U;       // 再次进入搜索时重新把云台抬到初始角度
@@ -115,37 +150,20 @@ static uint8_t target_count_for_type(uint8_t type)
 }
 static uint8_t cargo_matches_selected_target(void)
 {
-    if(my_car.vision_manager.hazard_count != 0U)
-    {
-        return 0U;
-    }
-    if(my_car.vision_manager.target_num == 0U)
-    {
-        return 0U;
-    }
-    if(first_normal_delivered == 0U)
-    {
-        if(my_car.vision_manager.normal_count == 1U && my_car.vision_manager.core_count == 0U && my_car.vision_manager.patient_count == 0U)
-        {
-            selected_type = MAIXCAM_TARGET_NORMAL_MATERIAL;
-            return 1U;
-        }
-        else
-        {
-            return 0U;
-        }
-    }
-    if(my_car.vision_manager.patient_count == 1U && my_car.vision_manager.core_count == 0U && my_car.vision_manager.normal_count == 0U)
-    {
-        selected_type = MAIXCAM_TARGET_PATIENT;
-        return 2U;
-    }
-    else if(my_car.vision_manager.core_count + my_car.vision_manager.normal_count <= 3U && my_car.vision_manager.patient_count == 0U)
-    {
-        selected_type = MAIXCAM_TARGET_CORE_MATERIAL;
-        return 3U;
-    }
-    return 0U;
+    /* 模式9本来就没有导航目标，不能用 target_num/is_valid 判定运输失败。
+     * 这里仍读取现有共享字段；同帧快照与舵机完成反馈需电控侧配套。 */
+    candidate_cargo = (CargoCounts){
+        .normal = my_car.vision_manager.normal_count,
+        .core = my_car.vision_manager.core_count,
+        .patient = my_car.vision_manager.patient_count,
+        .hazard = my_car.vision_manager.hazard_count
+    };
+    return (uint8_t)cargo_evaluate(candidate_cargo, first_normal_delivered);
+}
+
+CargoCounts Grab_GetConfirmedCargo(void)
+{
+    return confirmed_cargo;
 }
 
 /* 目标类型 → 对应的投放区视觉模式（伤员送伤员区，其余送物资区） */
@@ -429,9 +447,13 @@ void rescue_grab_task(void *pvParameters)
                 confirm_last_sequence = my_car.vision_manager.sequence;
                 confirm_sequence_valid = 1U;
                 uint8_t cur_match = cargo_matches_selected_target();
-                if (cur_match && last_match == cur_match) 
-                {
-                    cargo_confirm_ticks++; 
+                if (cur_match != CARGO_REJECTED) {
+                    /* 类别或数量变化都从当前第1帧重新计数，不能只比较“物资类”。 */
+                    if (last_match == cur_match && cargo_counts_equal(candidate_cargo, previous_cargo)) {
+                        cargo_confirm_ticks++;
+                    } else {
+                        cargo_confirm_ticks = 1U;
+                    }
                     cargo_error_ticks = 0U;
                 } 
                 else {
@@ -439,6 +461,7 @@ void rescue_grab_task(void *pvParameters)
                     cargo_error_ticks++;
                 }
                 last_match = cur_match;
+                previous_cargo = candidate_cargo;
                 if(cargo_error_ticks >= GRAB_VERIFY_FRAMES)
                 {
                     open_big_posture();                 // 大张口
@@ -455,6 +478,10 @@ void rescue_grab_task(void *pvParameters)
                 }
                 if (cargo_confirm_ticks >= GRAB_VERIFY_FRAMES)
                 {
+                    confirmed_cargo = candidate_cargo;
+                    selected_type = confirmed_cargo.patient != 0U ? MAIXCAM_TARGET_PATIENT :
+                                    confirmed_cargo.core != 0U ? MAIXCAM_TARGET_CORE_MATERIAL :
+                                    MAIXCAM_TARGET_NORMAL_MATERIAL;
                     cargo_confirm_ticks = 0U;
                     Set_Vision_Mode(zone_mode_for_type(selected_type));
                     enter_state(RESCUE_GRAB_APPROACH_ZONE);
@@ -524,7 +551,7 @@ void rescue_grab_task(void *pvParameters)
             break;
         /* --- 前推：一段固定时长的开环前进，把目标推进投放区 --- */
         case RESCUE_GRAB_PUSH:
-            if(selected_type == MAIXCAM_MODE_PATIENT_ZONE)
+            if(selected_type == MAIXCAM_TARGET_PATIENT)
                 my_car.angle_manager.target_yaw = 150;
             else
             {
