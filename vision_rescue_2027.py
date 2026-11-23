@@ -109,6 +109,16 @@ class Mode:
     CONFIRM_CARGO = 9  # 只统计CONFIRM_ROI内类别，不输出导航目标。
 
 
+class NavigationAction:
+    """回基地识别的五种业务状态；字符串供本地使用，不是串口类型号。"""
+
+    FOLLOW_ZONE = "FOLLOW_ZONE"                  # 跟随本帧可见的己方整体安全区。
+    FOLLOW_SPLIT = "FOLLOW_SPLIT"                # 跟随本帧可见的己方分界线。
+    HOLD_LAST_SPEED = "HOLD_LAST_SPEED"          # 已跟线后短时漏检，请求按剩余时间保持速度。
+    SEARCH_ZONE = "SEARCH_ZONE"                  # 没有可用参照，重新寻找己方整体安全区。
+    NOT_RETURNING_TO_BASE = "NOT_RETURNING_TO_BASE"  # 非回基地阶段，不干涉其他任务。
+
+
 # 模型 class_id 随标签顺序变化；物资协议类型号独立于标签顺序。
 TYPE_BY_LABEL = {
     "HAZARD": TargetType.HAZARD,
@@ -131,6 +141,7 @@ TEAM_ZONE_LABELS = {
 VALID_MODES = (0, 1, 2, 3, 5, 6, 7, 8, 9)
 # 调试时在电脑修改后传到相机运行；有效 STM32 命令仍会覆盖这两个初值。
 INITIAL_MODE = Mode.OBSERVE
+# 启动前填写 1=蓝方、2=红方；0仅作未填写提示，运行时会报错，不进入等待选队流程。
 INITIAL_TEAM = 0
 
 
@@ -284,8 +295,7 @@ class ZoneFollower:
 
     def update(self, objects, team, now_ms):
         if team not in TEAM_ZONE_LABELS:
-            self.reset()
-            return None
+            raise ValueError("回基地前必须配置队伍：1=蓝方，2=红方")
         zone_label, split_label = TEAM_ZONE_LABELS[team]
         zones = [o for o in objects if valid_detection(o) and LABELS[o.class_id] == zone_label]
         splits = [o for o in objects if valid_detection(o) and LABELS[o.class_id] == split_label]
@@ -317,20 +327,25 @@ class ZoneFollower:
 def navigation_observation(follower, target, mode, team, now_ms):
     """导航业务结果，供界面及后续报文适配使用；不是新的串口帧定义。
 
-    purpose 保留运输目的；action 是所需动作意图，不代表主控已接收或执行。
-    HOLD_LAST_SPEED 无新检测坐标，绝不能通过旧 valid=1 冒充目标仍可见。
+    purpose 保留物资/伤员的运输目的，action 只取 NavigationAction 的五种状态。
+    FOLLOW_ZONE/FOLLOW_SPLIT 携带当前参照框；HOLD_LAST_SPEED 只提供剩余
+    宽限时间，不拿旧框冒充新检测，也不代表底盘已经保持速度。
+    SEARCH_ZONE 没有可用参照；NOT_RETURNING_TO_BASE 清空找区历史，
+    只表示当前不执行找区逻辑，不要求底盘停车。队伍是进入回基地前的配置条件。
     """
     purpose = {Mode.MATERIAL_ZONE: "MATERIAL", Mode.PATIENT_ZONE: "PATIENT"}.get(mode)
     if purpose is None:
-        action = "IDLE"
-    elif team not in TEAM_ZONE_LABELS:
-        action = "WAIT_TEAM"
+        # 即使单独调用此函数，退出回基地时也不保留上一轮跟线和计时状态。
+        follower.reset()
+        action = NavigationAction.NOT_RETURNING_TO_BASE
     else:
-        action = {"ZONE": "FOLLOW_ZONE", "SPLIT": "FOLLOW_SPLIT",
-                  "HOLD": "HOLD_LAST_SPEED", "SEARCH": "SEARCH_ZONE"}[follower.state]
-    visible = target is not None and action in ("FOLLOW_ZONE", "FOLLOW_SPLIT")
+        if team not in TEAM_ZONE_LABELS:
+            raise ValueError("回基地前必须配置队伍：1=蓝方，2=红方")
+        action = {"ZONE": NavigationAction.FOLLOW_ZONE, "SPLIT": NavigationAction.FOLLOW_SPLIT,
+                  "HOLD": NavigationAction.HOLD_LAST_SPEED, "SEARCH": NavigationAction.SEARCH_ZONE}[follower.state]
+    visible = target is not None and action in (NavigationAction.FOLLOW_ZONE, NavigationAction.FOLLOW_SPLIT)
     hold_remaining = 0
-    if action == "HOLD_LAST_SPEED":
+    if action == NavigationAction.HOLD_LAST_SPEED:
         hold_remaining = max(0, SPLIT_LOST_MS - (now_ms - follower.last_split_ms))
     return {
         "purpose": purpose,
@@ -458,6 +473,9 @@ def result_packet(sequence, mode, team, target, count, cargo_counts):
 # ============================================================================
 
 def main():
+    # 配置在启动前完成，不设置 WAIT_TEAM 等待状态，也不擅自默认红蓝。
+    if INITIAL_MODE not in VALID_MODES or INITIAL_TEAM not in TEAM_ZONE_LABELS:
+        raise ValueError("启动前请设置 INITIAL_MODE，并将 INITIAL_TEAM 填为1（蓝）或2（红）")
     # 延迟导入 maix 模块：便于在 PC 上做纯逻辑测试/静态检查时不依赖硬件库
     from maix import camera, display, image, nn, app, uart, err, pinmap, time
 
@@ -468,9 +486,6 @@ def main():
     model_labels = getattr(detector, "labels", None)
     if model_labels is None or tuple(model_labels) != LABELS:
         raise RuntimeError("模型标签不一致；需要 %r，实际 %r" % (LABELS, model_labels))
-
-    if INITIAL_MODE not in VALID_MODES or INITIAL_TEAM not in (0, 1, 2):
-        raise ValueError("INITIAL_MODE 或 INITIAL_TEAM 无效")
 
     # 把 A16/A17 复用为 UART0 的 TX/RX，用于和 STM32 通信
     for pin, function in (("A16", "UART0_TX"), ("A17", "UART0_RX")):
@@ -488,8 +503,11 @@ def main():
         # --- 1) 接收 STM32 命令：一次 read 可能包含多条，只保留最后一条有效命令 ---
         chunk = serial.read(256)
         if chunk:
-            for mode, team in parser.feed(chunk):
-                pass  # 使用最后一条有效命令；不在视觉端修改任务完成状态。
+            for command_mode, command_team in parser.feed(chunk):
+                # 帧格式仍兼容team=0，但不让未配置命令覆盖启动前选好的队伍。
+                # 模式和队伍一起采用，避免只改模式却误用另一队伍。
+                if command_team in TEAM_ZONE_LABELS:
+                    mode, team = command_mode, command_team
 
         # --- 2) 取图并推理（必须在画图之前，避免文字/框污染模型输入） ---
         frame = cam.read()
