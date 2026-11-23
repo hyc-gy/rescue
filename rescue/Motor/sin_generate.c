@@ -1,7 +1,7 @@
 #include "sin_generate.h"
+#include "common.h" 
 
 TaskHandle_t sin_task_handler;
-#define PI 3.1415926f
 																		//最大速度   角度跨度
 struct sin_param sin_use_motor={0,0,60,0.15*10};
 

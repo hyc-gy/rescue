@@ -62,6 +62,7 @@ void gyro_init(void) {
 /* USART3 空闲中断处理：由 stm32h7xx_it.c 的 USART3_IRQHandler 调用
  * 注意 huart3 是 USART3 的句柄，对应 PD8/PD9 接 JY61 */
 void gyro_uart_irq_handler(void) {
+    //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
     if (__HAL_UART_GET_FLAG(&huart3,UART_FLAG_IDLE)!=RESET) {
         __HAL_UART_CLEAR_IDLEFLAG(&huart3);
         HAL_UART_DMAStop(&huart3);                                   // 先停 DMA，保证数据不再变化

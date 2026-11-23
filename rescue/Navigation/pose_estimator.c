@@ -10,7 +10,7 @@ static float last_imu_yaw;              // 上次 IMU 累计 yaw
 static uint8_t imu_anchor;              // IMU 基准点是否已建立（1=已对齐首帧）
 
 /* 把任意角度规范化到 [-180°, +180°] */
-static float wrap(float a) {
+float wrap(float a) {
     while (a > 180.0f) a -= 360.0f;
     while (a < -180.0f) a += 360.0f;
     return a;
@@ -78,6 +78,8 @@ void pose_update_from_encoders(void) {
     my_car.pose_manager.y+=ds*sinf(mid);
     float dx = my_car.pose_manager.target_x-my_car.pose_manager.x;
     float dy = my_car.pose_manager.target_y-my_car.pose_manager.y;      
+    my_car.angle_manager.target_gyroT = atan2f(dy, dx)*180.0f/PI;
+    my_car.angle_manager.target_gyroT = wrap(my_car.angle_manager.target_gyroT);
     my_car.pose_manager.distance=sqrtf(dx*dx+dy*dy);       // 累计行驶距离（里程）
     my_car.pose_manager.speed_mps=dt ? ds*1000.0f/dt : 0;   // 瞬时速度（m/s）      
     my_car.pose_manager.valid=POSE_CALIBRATED && dt>0 && dt<=100U;  // 本帧 pose 是否可信

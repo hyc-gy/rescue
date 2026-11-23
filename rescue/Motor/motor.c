@@ -7,7 +7,7 @@
 #include "math.h"
 #include <stdio.h>
 
-#define PI 3.1415926f
+#include "pose_estimator.h"
 
 float MAX_SPEED_rate = 0.8f;//0.8
 int32_t MOTOR_PWM_MAX = 900;
@@ -100,21 +100,21 @@ void pid_init(void){
     Vision_y_pid_param.outputMin = -28;
     Vision_y_pid_param.differential_filterK =0.5f;
 
-    distance_pid_param.kp=0.0f;
+    distance_pid_param.kp=10.0f;
     distance_pid_param.ki=0;
     distance_pid_param.kd=0.0f;
     distance_pid_param.outputMax = 15;
     distance_pid_param.outputMin = -15;
     distance_pid_param.differential_filterK =0.5f;
     
-    yaw_pid_param.kp=0.0f;
-    yaw_pid_param.ki=0;
+    yaw_pid_param.kp=0.45f;
+    yaw_pid_param.ki=0.0f;
     yaw_pid_param.kd=0.0f;
     yaw_pid_param.outputMax = 28;
     yaw_pid_param.outputMin = -28;
     yaw_pid_param.differential_filterK =0.5f;
 
-    gyroT_pid_param.kp=0.0f;
+    gyroT_pid_param.kp=0.45f;
     gyroT_pid_param.ki=0;
     gyroT_pid_param.kd=0.0f;
     gyroT_pid_param.outputMax = 28;
@@ -133,10 +133,10 @@ void motor_init(void){
 }
 
 void get_encoder(void){
-    motor_L0.measure = (float)(int16_t)TIM2->CNT;
-    motor_R0.measure = (float)(int16_t)TIM4->CNT;
-    motor_L1.measure = (float)(int16_t)TIM3->CNT;
-    motor_R1.measure = (float)(int16_t)TIM8->CNT;
+    motor_L0.measure = -(float)(int16_t)TIM2->CNT;
+    motor_R0.measure = -(float)(int16_t)TIM4->CNT;
+    motor_L1.measure = -(float)(int16_t)TIM3->CNT;
+    motor_R1.measure = -(float)(int16_t)TIM8->CNT;
 
 	TIM3->CNT = 0;
     TIM2->CNT = 0;
@@ -182,19 +182,19 @@ void motor_set_pwm(uint8_t motor_idx, int32_t pid_out){
         switch (motor_idx){
             case 1:
                 TIM15->CCR2 = ccr;
-                motor_set_direction(1,0);// 正转
+                motor_set_direction(1,1);// 正转
                 break;
             case 2:
                 TIM12->CCR2 = ccr;
-                motor_set_direction(2,0);// 正转
+                motor_set_direction(2,1);// 正转
                 break;
             case 3:
                 TIM15->CCR1 = ccr;
-                motor_set_direction(3,0);// 正转
+                motor_set_direction(3,1);// 正转
                 break;
             case 4:
                 TIM12->CCR1 = ccr;
-                motor_set_direction(4,0);// 正转
+                motor_set_direction(4,1);// 正转
                 break;
             default:
                 break;
@@ -207,19 +207,19 @@ void motor_set_pwm(uint8_t motor_idx, int32_t pid_out){
             ccr = -pid_out;
         switch (motor_idx){
             case 1:
-                motor_set_direction(1,1);
+                motor_set_direction(1,0);
                 TIM15->CCR2 = ccr;
                 break;
             case 2:
-                motor_set_direction(2,1);
+                motor_set_direction(2,0);
                 TIM12->CCR2 = ccr;
                 break;
             case 3:
-                motor_set_direction(3,1);
+                motor_set_direction(3,0);
                 TIM15->CCR1 = ccr;
                 break;
             case 4:
-                motor_set_direction(4,1);
+                motor_set_direction(4,0);
                 TIM12->CCR1 = ccr;
                 break;
             default:
@@ -303,19 +303,18 @@ void motor_task(void *pvParameters){
         // open_big_posture();
         // my_delay_ms(2000);
         //grab_posture();
-    HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_1);
-    //TIM1->CCR1 = 34;
-    if(TIM1->CCR1 == 150)
-    {
-      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
-    }
-    my_delay_ms(1000);
-    //TIM1->CCR1 = 60;
-    if(TIM1->CCR1 == 60)
-    {
-      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
-    }
-    my_delay_ms(1000);
+    //TIM1->CCR1 = 150;
+    // if(TIM1->CCR1 == 150)
+    // {
+    //   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
+    // }
+    // my_delay_ms(1000);
+    // //TIM1->CCR1 = 60;
+    // if(TIM1->CCR1 == 60)
+    // {
+    //   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+    // }
+    // my_delay_ms(1000);
         get_encoder();
         pose_update_from_encoders();
         collision_guard_update();
@@ -323,7 +322,9 @@ void motor_task(void *pvParameters){
         /* 碰撞恢复期间由 motor_task 独占电机，跳过正常控制 */
         if(++cnt==10)
         {
-            HC05_Printf("%d,%d,%d\n",(int16_t)motor_L0.measure,(int16_t)motor_R0.measure,(int16_t)10*my_car.angle_manager.yaw);
+            //HC05_Printf("%d\n",(int16_t)(100*my_car.angle_manager.yaw));
+            HC05_Printf("%d,%d,%d\n",
+             (int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),(int)(100*my_car.pose_manager.y));
             cnt =0;
         }
         if (collision_recover_step(HAL_GetTick())) {
@@ -353,7 +354,6 @@ void motor_task(void *pvParameters){
 
                 float x_speed = positional_PID(&Vision_x_pid_obj, &Vision_x_pid_param);
                 float y_speed = positional_PID(&Vision_y_pid_obj, &Vision_y_pid_param);
-
 //                motor_L0.target =  speed - x_speed + y_speed;
 //                motor_R0.target =  speed + x_speed + y_speed;
 //                motor_L1.target =  speed - x_speed + y_speed;
@@ -409,23 +409,41 @@ void motor_task(void *pvParameters){
             case MOTOR_POSITION:
                 float turn_speed = 0;
                 distance_pid_obj.bias = my_car.pose_manager.distance;
-                gyroT_pid.bias = my_car.angle_manager.target_gyroT - my_car.angle_manager.yaw;
-                if (gyroT_pid.bias>PI/3 || gyroT_pid.bias<-PI/3)
+                gyroT_pid.bias = wrap(my_car.angle_manager.target_gyroT - my_car.angle_manager.yaw);
+                float forward_speed = 0;
+                if(my_car.pose_manager.target_x == -1 && my_car.pose_manager.target_y == -1)
+                {
+                    /* 纯转向模式：(-1,-1) 是"不前进"标记，只跟踪 target_yaw。
+                     * 注意必须先更新 yaw_pid_obj.bias，否则 error_PID 会用上一拍的旧误差。 */
+                    yaw_pid_obj.bias = wrap(my_car.angle_manager.target_yaw - my_car.angle_manager.yaw);
+                    turn_speed = error_PID(&yaw_pid_obj, &yaw_pid_param);
+                    forward_speed = 0;
+                    if(fabsf(yaw_pid_obj.bias) <= 4.0f)
+                    {
+                        my_car.pose_manager.finished = 1;
+                    }
+                }
+                else{
+                if (gyroT_pid.bias>45 || gyroT_pid.bias<-45)
                 {
                     distance_pid_obj.bias = 0;
                 }
-                if (distance_pid_obj.bias>0 && distance_pid_obj.bias<0.025)
+                if (distance_pid_obj.bias>=0 && distance_pid_obj.bias<=0.025)
                 {
                     gyroT_pid.bias = 0;
                     distance_pid_obj.bias = 0;
-                    yaw_pid_obj.bias = my_car.angle_manager.target_yaw - my_car.angle_manager.yaw;
+                    yaw_pid_obj.bias = wrap(my_car.angle_manager.target_yaw - my_car.angle_manager.yaw);
                     turn_speed = error_PID(&yaw_pid_obj, &yaw_pid_param);
                 }
                 else{
                     turn_speed = error_PID(&gyroT_pid, &gyroT_pid_param);
                 }
-                float forward_speed = error_PID(&distance_pid_obj, &distance_pid_param);
-                
+                forward_speed = error_PID(&distance_pid_obj, &distance_pid_param);
+                if(distance_pid_obj.bias <= 0.025 && yaw_pid_obj.bias <= 4 && yaw_pid_obj.bias >= -4)
+                {
+                    my_car.pose_manager.finished = 1;
+                }
+            }
 
                 motor_L0.target = forward_speed-turn_speed/2;
                 motor_R0.target = forward_speed+turn_speed/2;

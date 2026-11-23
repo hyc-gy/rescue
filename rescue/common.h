@@ -11,17 +11,18 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-
+//队伍颜色：1：蓝色，2：红色
 #define sin_work 0
 #define sin_motor_idx 1
 #define motor_work 1
 #define grab_bolls_work 0//1
 #define rudder_work 1//1
-
 #define no_target 0
 #define toward_target 1
 #define disrupt_bolls 2
-
+//初始位置，1=左边，2=右边
+#define initial_pose 1
+#define PI 3.14159265358979323846
 struct Vision_Manager{
     uint8_t team;
     uint8_t target_num;
