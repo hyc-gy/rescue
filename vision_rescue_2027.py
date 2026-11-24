@@ -68,6 +68,7 @@ SEARCH_ROI = (0.0, 0.0, 1.0, 1.0)
 CONFIRM_ROI = (0.0, 0.3125, 1.0, 1.0)
 SPLIT_CONFIRM_FRAMES = 10  # 切换前连续新画面均需通过区域包含检查
 SPLIT_LOST_MS = 500       # 仅跟随状态的本地计时；保持底盘速度需 STM32 配套
+LOG_INTERVAL_MS = 500     # MaixVision终端：状态变化立即输出，普通数据每500ms输出一次。
 VERSION = 3                                        # 协议版本，命令帧与结果帧必须一致
 # 结果帧正文格式：10 个 uint8 + 4 个 uint16 + 2 个 uint8，共 20 字节，大端。
 # 依次为 version,seq,mode,team,type,count,hazard,normal,core,patient,cx,cy,w,h,score,valid
@@ -477,10 +478,56 @@ def result_packet(sequence, mode, team, target, count, cargo_counts):
 # 6) 主循环
 # ============================================================================
 
+MODE_NAMES_CN = {
+    Mode.OBSERVE: "观察全部可搬运物", Mode.NORMAL_MATERIAL: "寻找绿色普通物资",
+    Mode.CORE_MATERIAL: "寻找黑色核心物资", Mode.PATIENT: "寻找橙色伤员",
+    Mode.MATERIAL_ZONE: "回己方物资区", Mode.PATIENT_ZONE: "回己方伤员区",
+    Mode.RESCUE_TARGETS: "寻找三类救援目标", Mode.MIXED_MATERIALS: "寻找普通和核心物资",
+    Mode.CONFIRM_CARGO: "检查运输范围内的物品数量",
+}
+TEAM_NAMES_CN = {1: "蓝方", 2: "红方"}
+LABEL_NAMES_CN = {
+    "HAZARD": "浅蓝危险物", "NORMAL_MATERIAL": "绿色普通物资",
+    "CORE_MATERIAL": "黑色核心物资", "PATIENT": "橙色伤员",
+    "Blue_Zone": "蓝方整体安全区", "Red_Zone": "红方整体安全区",
+    "Blue_Zone_Split": "蓝方分界线", "Red_Zone_Split": "红方分界线",
+}
+NAVIGATION_NAMES_CN = {
+    NavigationAction.FOLLOW_ZONE: "跟随整体安全区中心",
+    NavigationAction.FOLLOW_SPLIT: "跟随分界线中心",
+    NavigationAction.HOLD_LAST_SPEED: "分界线暂时漏检，请求保持上一速度",
+    NavigationAction.SEARCH_ZONE: "未找到可用参照，请求旋转寻找安全区",
+    NavigationAction.NOT_RETURNING_TO_BASE: "非回基地阶段",
+}
+
+
+def format_debug_status(mode, team, source, navigation, target, count, cargo_counts):
+    """终端中文摘要；只描述视觉结果，不把动作请求写成车辆已执行。"""
+    returning = navigation["purpose"] is not None
+    state = NAVIGATION_NAMES_CN[navigation["action"]] if returning else MODE_NAMES_CN[mode]
+    detail = "无可用目标"
+    if target is not None:
+        detail = "%s，中心=(%.1f,%.1f)，宽高=(%.1f,%.1f)，置信度=%.2f" % (
+            LABEL_NAMES_CN[LABELS[target.class_id]], target.x + target.w / 2,
+            target.y + target.h / 2, target.w, target.h, target.score)
+    text = "[视觉状态] 队伍=%s；模式=%d（%s）；配置来源=%s；当前=%s；目标=%s" % (
+        TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode], source, state, detail)
+    if returning:
+        text += "；分界线确认=%d/%d帧；漏检保持剩余=%d毫秒；区域导航仅本地判断，尚未回传" % (
+            navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES, navigation["hold_remaining_ms"])
+    else:
+        text += "；可选目标=%d" % count
+    return text + "；范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
+        cargo_counts[TargetType.NORMAL_MATERIAL], cargo_counts[TargetType.CORE_MATERIAL],
+        cargo_counts[TargetType.PATIENT], cargo_counts[TargetType.HAZARD])
+
+
 def main():
     # 配置在启动前完成，不设置 WAIT_TEAM 等待状态，也不擅自默认红蓝。
     if INITIAL_MODE not in VALID_MODES or INITIAL_TEAM not in TEAM_ZONE_LABELS:
         raise ValueError("启动前请设置 INITIAL_MODE，并将 INITIAL_TEAM 填为1（蓝）或2（红）")
+    print("[启动配置] 队伍=%s；模式=%d（%s）；来源=代码固定配置" % (
+        TEAM_NAMES_CN[INITIAL_TEAM], INITIAL_MODE, MODE_NAMES_CN[INITIAL_MODE]), flush=True)
     # 延迟导入 maix 模块：便于在 PC 上做纯逻辑测试/静态检查时不依赖硬件库
     from maix import camera, display, image, nn, app, uart, err, pinmap, time
 
@@ -503,6 +550,9 @@ def main():
     mode, team, sequence = INITIAL_MODE, INITIAL_TEAM, 0
     zone_follower = ZoneFollower()
     zone_context = None
+    config_source = "代码固定配置"
+    last_log_key = None
+    last_log_ms = 0
 
     while not app.need_exit():
         # --- 1) 接收 STM32 命令：一次 read 可能包含多条，只保留最后一条有效命令 ---
@@ -512,7 +562,12 @@ def main():
                 # 帧格式仍兼容team=0，但不让未配置命令覆盖启动前选好的队伍。
                 # 模式和队伍一起采用，避免只改模式却误用另一队伍。
                 if command_team in TEAM_ZONE_LABELS:
+                    if config_source != "STM32主控命令" or (mode, team) != (command_mode, command_team):
+                        print("[主控命令] %s，模式%d（%s） → %s，模式%d（%s）" % (
+                            TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode],
+                            TEAM_NAMES_CN[command_team], command_mode, MODE_NAMES_CN[command_mode]), flush=True)
                     mode, team = command_mode, command_team
+                    config_source = "STM32主控命令"
 
         # --- 2) 取图并推理（必须在画图之前，避免文字/框污染模型输入） ---
         frame = cam.read()
@@ -541,6 +596,15 @@ def main():
         # --- 4) 回传结果帧，并递增 8 位帧序号（STM32 用它去重） ---
         serial.write(result_packet(sequence, mode, team, target, count, cargo_counts))
         sequence = (sequence + 1) & 255
+
+        # 日志使用标准输出供MaixVision查看，不向STM32串口写入中文文本。
+        # 模式、队伍、来源或导航状态变化立即打印；坐标/计数按时间间隔刷新，避免逐帧刷屏。
+        log_key = (mode, team, config_source, navigation["action"])
+        if log_key != last_log_key or observed_ms - last_log_ms >= LOG_INTERVAL_MS:
+            selected = zone_target if context is not None else target
+            print(format_debug_status(mode, team, config_source, navigation,
+                                      selected, count, cargo_counts), flush=True)
+            last_log_key, last_log_ms = log_key, observed_ms
 
         # --- 5) 本地调试绘图：命中目标画绿框，其余画红框，并标出 ROI ---
         for obj in objects:
