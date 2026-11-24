@@ -21,7 +21,7 @@ count是当前模式可见数量，不是载荷数、完成数或允许一次搬
 搜索模式(mode 0-8)的目标总数、三类数量及hazard_count均只统计SEARCH_ROI内目标中心。
 确认模式(mode 9)只统计CONFIRM_ROI；三类物品要求检测框完整在区域内，
 危险物只要与区域有交叠就计数；该模式不输出导航目标。
-CONFIRM_ROI使用归一化(左,上,右,下)参数，由用户按新相机角度及夹具视野调整；
+CONFIRM_ROI使用归一化(左,上,右,下)参数；第三姿态低头后整幅画面对应夹具范围；
 STM32需检查帧新鲜度及hazard_count，不能因valid=0忽略危险物数据。
 遮挡、漏检仍可能发生，单帧类别计数为0不等于已确认抓取失败或成功；
 建议连续多帧稳定后由STM32确认物品类别，三类总数及危险物数量保持独立。
@@ -64,8 +64,15 @@ TARGET_X_WEIGHT = 0.65  # 横向居中项权重（偏离画面中线越远，代
 TARGET_Y_WEIGHT = 0.35  # 纵向靠近项权重（中心越靠画面下方，代价越小）
 # 搜索阶段的目标选择和所有数量统计均使用此区域；参数为归一化(左,上,右,下)。
 SEARCH_ROI = (0.0, 0.0, 1.0, 1.0)
-# 确认阶段只使用此区域。请根据相机和夹具的实际画面修改这四个参数。
-CONFIRM_ROI = (0.0, 0.3125, 1.0, 1.0)
+# 相机姿态按流程编号，由STM32舵机执行：1=出发最低头，2=抬头找物并接近，
+# 3=低头检查夹子，4=更抬头寻找安全区（比第二姿态更抬头）。
+# 第一姿态用于满足出发整车高度不超过20cm的要求；
+# 由STM32在出发阶段保持，进入找物阶段后再抬到第二姿态，不能因相机程序启动就抬头。
+# 第一姿态与第三姿态用途不同，不默认共用同一个舵机位置；具体位置由队友标定。
+# 姿态编号不是Mode模式号，也不是已约定的串口字段。
+# 第三姿态的整幅画面就是夹子检查范围，因此运输确认不再额外裁掉画面上部。
+# 必须由业务流程等低头动作稳定并取得新画面后再确认，mode=9本身不代表舵机已到位。
+CONFIRM_ROI = (0.0, 0.0, 1.0, 1.0)
 SPLIT_CONFIRM_FRAMES = 10  # 切换前连续新画面均需通过区域包含检查
 SPLIT_LOST_MS = 500       # 仅跟随状态的本地计时；保持底盘速度需 STM32 配套
 LOG_INTERVAL_MS = 500     # MaixVision终端：状态变化立即输出，普通数据每500ms输出一次。
@@ -147,8 +154,9 @@ VALID_MODES = (0, 1, 2, 3, 5, 6, 7, 8, 9)
 #       5=回己方物资区，6=回己方伤员区，7=三类救援目标，8=普通+核心，9=运输确认。
 # 4不可用；例如只调蓝方回物资区，填写 INITIAL_MODE=5、INITIAL_TEAM=1。
 # 注意：这两项是启动初值；收到 STM32 的有效模式/队伍命令后，仍会采用命令值。
+# 本轮先调蓝方、1号位；出发位对应的起步动作由主控执行，不占用Mode模式号。
 INITIAL_MODE = 0  # 按上表填写当前要调试的模式。
-INITIAL_TEAM = 0  # 开始调试前改为1=蓝方或2=红方；0仅作占位，保留0会报配置错误。
+INITIAL_TEAM = 1  # 当前默认蓝方；后续手动改红方时填2。
 
 
 # ============================================================================
@@ -354,6 +362,7 @@ def navigation_observation(follower, target, mode, team, now_ms):
     if action == NavigationAction.HOLD_LAST_SPEED:
         hold_remaining = max(0, SPLIT_LOST_MS - (now_ms - follower.last_split_ms))
     return {
+        "mode": mode,
         "purpose": purpose,
         "team": team,
         "action": action,
@@ -501,7 +510,7 @@ NAVIGATION_NAMES_CN = {
 }
 
 
-def format_debug_status(mode, team, source, navigation, target, count, cargo_counts):
+def format_debug_status(mode, team, source, navigation, target, count, cargo_counts, navigation_connected=False):
     """终端中文摘要；只描述视觉结果，不把动作请求写成车辆已执行。"""
     returning = navigation["purpose"] is not None
     state = NAVIGATION_NAMES_CN[navigation["action"]] if returning else MODE_NAMES_CN[mode]
@@ -513,8 +522,9 @@ def format_debug_status(mode, team, source, navigation, target, count, cargo_cou
     text = "[视觉状态] 队伍=%s；模式=%d（%s）；配置来源=%s；当前=%s；目标=%s" % (
         TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode], source, state, detail)
     if returning:
-        text += "；分界线确认=%d/%d帧；漏检保持剩余=%d毫秒；区域导航仅本地判断，尚未回传" % (
+        text += "；分界线确认=%d/%d帧；漏检保持剩余=%d毫秒" % (
             navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES, navigation["hold_remaining_ms"])
+        text += "；导航数据已交发送适配，接收执行待核对" if navigation_connected else "；导航发送适配未接入，仅本地判断"
     else:
         text += "；可选目标=%d" % count
     return text + "；范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
@@ -522,7 +532,14 @@ def format_debug_status(mode, team, source, navigation, target, count, cargo_cou
         cargo_counts[TargetType.PATIENT], cargo_counts[TargetType.HAZARD])
 
 
-def main():
+def main(navigation_sender=None):
+    """navigation_sender由双方确认协议后接入，签名为sender(serial, observation)。
+
+    observation包含mode/team/purpose/action/reference_label/bbox/confidence/
+    confirm_frames/hold_remaining_ms/sequence；坐标为中心xywh像素，分数为0—1。
+    此回调每张推理新画面调用一次，与原24字节结果帧共享sequence。
+    未提供回调时不发送臆定扩展帧，终端明确显示未接入；原7/24字节协议照常工作。
+    """
     # 配置在启动前完成，不设置 WAIT_TEAM 等待状态，也不擅自默认红蓝。
     if INITIAL_MODE not in VALID_MODES or INITIAL_TEAM not in TEAM_ZONE_LABELS:
         raise ValueError("启动前请设置 INITIAL_MODE，并将 INITIAL_TEAM 填为1（蓝）或2（红）")
@@ -534,7 +551,8 @@ def main():
     # 启动前检查模型：缺模型或标签不匹配时直接报错退出，避免“带病运行”
     if not os.path.isfile(MODEL_PATH):
         raise RuntimeError("找不到模型，请将模型包上传到相机并核对 MODEL_PATH: %s" % MODEL_PATH)
-    detector = nn.YOLOv5(model=MODEL_PATH)
+    # 明确让结果对应当前输入画面，避免双缓冲把转姿态前的结果带入新阶段。
+    detector = nn.YOLOv5(model=MODEL_PATH, dual_buff=False)
     model_labels = getattr(detector, "labels", None)
     if model_labels is None or tuple(model_labels) != LABELS:
         raise RuntimeError("模型标签不一致；需要 %r，实际 %r" % (LABELS, model_labels))
@@ -550,6 +568,7 @@ def main():
     mode, team, sequence = INITIAL_MODE, INITIAL_TEAM, 0
     zone_follower = ZoneFollower()
     zone_context = None
+    print("[导航接口] " + ("已绑定发送适配，接收及执行仍需核对" if navigation_sender is not None else "尚未接入；原24字节物资结果正常发送，整区/分界线仅本地判断"), flush=True)
     config_source = "代码固定配置"
     last_log_key = None
     last_log_ms = 0
@@ -595,6 +614,9 @@ def main():
 
         # --- 4) 回传结果帧，并递增 8 位帧序号（STM32 用它去重） ---
         serial.write(result_packet(sequence, mode, team, target, count, cargo_counts))
+        navigation["sequence"] = sequence
+        if navigation_sender is not None:
+            navigation_sender(serial, navigation)
         sequence = (sequence + 1) & 255
 
         # 日志使用标准输出供MaixVision查看，不向STM32串口写入中文文本。
@@ -603,7 +625,7 @@ def main():
         if log_key != last_log_key or observed_ms - last_log_ms >= LOG_INTERVAL_MS:
             selected = zone_target if context is not None else target
             print(format_debug_status(mode, team, config_source, navigation,
-                                      selected, count, cargo_counts), flush=True)
+                                      selected, count, cargo_counts, navigation_sender is not None), flush=True)
             last_log_key, last_log_ms = log_key, observed_ms
 
         # --- 5) 本地调试绘图：命中目标画绿框，其余画红框，并标出 ROI ---
@@ -631,7 +653,7 @@ def main():
         if context is not None:
             frame.draw_string(0, 48, "Local:%s %d/%d" % (
                 zone_follower.state, zone_follower.confirm_frames, SPLIT_CONFIRM_FRAMES), color=image.COLOR_WHITE)
-            frame.draw_string(0, 64, "Zone UART pending STM32", color=image.COLOR_WHITE)
+            frame.draw_string(0, 64, "Nav adapter active" if navigation_sender is not None else "Nav adapter pending", color=image.COLOR_WHITE)
             frame.draw_string(0, 80, "%s %dms" % (
                 navigation["action"], navigation["hold_remaining_ms"]), color=image.COLOR_WHITE)
         screen.show(frame)

@@ -33,6 +33,11 @@ static uint8_t rx_frame_length;                     // 当前窗口里已攒的�
 static uint8_t last_mode = 0xFFU;                   // 上次成功发送的模式（0xFF 表示还没发过）
 static uint8_t last_team = 0xFFU;                   // 上次成功发送的队伍
 static uint8_t last_command_valid;                  // 命令缓存是否有效（1=可以据此去重）
+/* 业务快照，不新增线上字段；新导航由队友的收包适配调用PublishNavigation发布。 */
+static uint32_t observation_frame_id;
+static MaixcamNavigation latest_navigation;
+static uint8_t configured_team = MAIXCAM_TEAM_DEFAULT;
+
 extern DMA_HandleTypeDef hdma_uart5_rx;
 
 /* CRC-16/CCITT-FALSE：多项式 0x1021，初值 0xFFFF，高位在前，不做结果异或 */
@@ -90,6 +95,12 @@ static void maixcam_publish_result(const uint8_t *frame)
         return;
     }
 
+    /* 重复帧不能刷新新鲜度或被业务重复计数。 */
+    if (my_car.vision_manager.frame_valid &&
+        my_car.vision_manager.sequence == body[1] &&
+        my_car.vision_manager.target_mode == body[2] &&
+        my_car.vision_manager.team == body[3]) return;
+    ++observation_frame_id;
     my_car.vision_manager.sequence = body[1];               // 帧序号
     my_car.vision_manager.target_mode = body[2];            // 视觉端当前工作模式
     my_car.vision_manager.team = body[3];                   // 队伍颜色
@@ -107,6 +118,59 @@ static void maixcam_publish_result(const uint8_t *frame)
     my_car.vision_manager.is_valid = target_valid;          // 目标是否有效
     my_car.vision_manager.frame_valid = 1U;                 // 标记"收到过有效帧"
     my_car.vision_manager.updated_ms = HAL_GetTick();       // 记录更新时间，供 IsFresh 判断
+}
+
+/* 快照时短暂屏蔽中断，防止UART更新到一半时读出混合帧；恢复原中断状态。 */
+void Maixcam_GetObservation(MaixcamObservation *out)
+{
+    uint32_t saved = __get_PRIMASK();
+    __disable_irq();
+    out->data = my_car.vision_manager;
+    out->frame_id = observation_frame_id;
+    __set_PRIMASK(saved);
+}
+
+void Maixcam_GetNavigation(MaixcamNavigation *out)
+{
+    uint32_t saved = __get_PRIMASK();
+    __disable_irq();
+    *out = latest_navigation;
+    __set_PRIMASK(saved);
+}
+
+uint8_t Maixcam_PublishNavigation(const MaixcamNavigation *n)
+{
+    if ((n->team != 1U && n->team != 2U) || !maixcam_mode_valid(n->mode) ||
+        n->action > MAIXCAM_NAV_SEARCH_ZONE || n->reference_visible > 1U ||
+        n->confidence > 100U || n->hold_remaining_ms > 500U) return 0U;
+    uint8_t returning = n->mode == MAIXCAM_MODE_MATERIAL_ZONE || n->mode == MAIXCAM_MODE_PATIENT_ZONE;
+    uint8_t visible = n->action == MAIXCAM_NAV_FOLLOW_ZONE || n->action == MAIXCAM_NAV_FOLLOW_SPLIT;
+    if (returning) {
+        if (n->action == MAIXCAM_NAV_NOT_RETURNING_TO_BASE) return 0U;
+    } else if (n->action != MAIXCAM_NAV_NOT_RETURNING_TO_BASE) return 0U;
+    if (visible) {
+        uint8_t expected = n->action == MAIXCAM_NAV_FOLLOW_ZONE
+            ? (n->team == 1U ? MAIXCAM_REFERENCE_BLUE_ZONE : MAIXCAM_REFERENCE_RED_ZONE)
+            : (n->team == 1U ? MAIXCAM_REFERENCE_BLUE_SPLIT : MAIXCAM_REFERENCE_RED_SPLIT);
+        if (!n->reference_visible || n->reference != expected || !n->w || !n->h ||
+            n->confidence < 50U || n->hold_remaining_ms) return 0U;
+    } else if (n->reference_visible || n->reference != MAIXCAM_REFERENCE_NONE ||
+               n->x || n->y || n->w || n->h || n->confidence) return 0U;
+    if (n->action != MAIXCAM_NAV_HOLD_LAST_SPEED && n->hold_remaining_ms) return 0U;
+    uint32_t saved = __get_PRIMASK();
+    __disable_irq();
+    if (latest_navigation.frame_valid && latest_navigation.sequence == n->sequence &&
+        latest_navigation.mode == n->mode && latest_navigation.team == n->team) {
+        __set_PRIMASK(saved);
+        return 0U;
+    }
+    uint32_t next = latest_navigation.frame_id + 1U;
+    latest_navigation = *n;
+    latest_navigation.updated_ms = HAL_GetTick();
+    latest_navigation.frame_id = next;
+    latest_navigation.frame_valid = 1U;
+    __set_PRIMASK(saved);
+    return 1U;
 }
 
 /* 丢弃滑动窗口里的第一个字节，用于重新对齐帧头 */
@@ -170,6 +234,9 @@ static void maixcam_parse_bytes(const uint8_t *data, uint16_t length)
 void Maixcam_init(void)
 {
     rx_frame_length = 0U;
+    observation_frame_id = 0U;
+    latest_navigation = (MaixcamNavigation){0};
+    configured_team = MAIXCAM_TEAM_DEFAULT;
     last_command_valid = 0U;
     my_car.vision_manager.frame_valid = 0U;
     my_car.vision_manager.is_valid = 0U;
@@ -178,14 +245,16 @@ void Maixcam_init(void)
 }
 
 /* 下发模式命令帧（7 字节）。
- * 返回 1：发送成功，或与上次完全相同无需重发；返回 0：参数非法 / 发送失败 */
+ * 返回1：发送成功或已新鲜回显无需重发；返回0：参数非法/发送失败。 */
 uint8_t Maixcam_SendCommand(uint8_t mode, uint8_t team)
 {
     if (!maixcam_mode_valid(mode) || team > 2U) {
         return 0U;                          // 参数非法，直接拒绝
     }
-    /* 与上次完全相同的命令不重复发，避免每 10ms 刷爆串口 */
-    if (last_command_valid && last_mode == mode && last_team == team) {
+    /* 同模式且相机已新鲜回显才去重；未生效或重启后继续发送，避免永久等不到模式。 */
+    if (last_command_valid && last_mode == mode && last_team == team &&
+        Maixcam_IsFresh(150U) && my_car.vision_manager.target_mode == mode &&
+        my_car.vision_manager.team == team) {
         return 1U;
     }
 
@@ -205,7 +274,7 @@ uint8_t Maixcam_SendCommand(uint8_t mode, uint8_t team)
     last_team = team;
     last_command_valid = 1U;
     my_car.track_mode = mode;            // 同步到全局，便于调试查看
-    my_car.vision_manager.team = team;
+    configured_team = team;
     return 1U;
 }
 
@@ -216,7 +285,7 @@ uint8_t Maixcam_SetTeam(uint8_t team)
     if (team != 1U && team != 2U) {
         return 0U;
     }
-    my_car.vision_manager.team = team;
+    configured_team = team;
     if (!last_command_valid) {
         return 1U;                       // 还没发过命令，无需重发
     }
@@ -227,7 +296,7 @@ uint8_t Maixcam_SetTeam(uint8_t team)
 /* 兼容旧接口：用当前队伍下发模式命令 */
 void Set_Vision_Mode(uint8_t mode)
 {
-    (void)Maixcam_SendCommand(mode, my_car.vision_manager.team);
+    (void)Maixcam_SendCommand(mode, configured_team);
 }
 
 /* 判断视觉数据是否新鲜：收到过有效帧，且距上次更新不超过 timeout_ms */

@@ -1,199 +1,171 @@
 #include "grab.h"
-#include "collision_guard.h"
+#include "motor.h"
+#include "hc05.h"
 #include "cmsis_os.h"
-#include <stdint.h>
+#include <string.h>
+#include <math.h>
 
+/* 本文件只决定下一业务动作；电机/PID/舵机/起步/搜索/位移由绑定的执行端实现。
+ * 每个动作带id，必须收到对应的真实完成反馈才推进，不用固定延时假定完成。
+ * 无执行适配时任务持续停车，不能把接口未接通当成动作成功。
+ */
 TaskHandle_t rescue_grab_handler;
+static GrabActionExecutor action_executor;
+static GrabActionRequest request, published_request;
+static GrabStage stage;
+static uint8_t configured_team = GRAB_TEAM_DEFAULT;
+static uint8_t vision_mode, start_requested, pose_done, camera_reset_seen;
+static uint8_t first_normal_delivered, execution_failed, can_hold_speed;
+static uint8_t good_frames, bad_frames, empty_timing, last_confirm_sequence;
+static uint32_t camera_reset_baseline, last_confirm_frame, empty_since_ms, navigation_baseline;
+static uint32_t pose_ready_since_ms;
+static CargoCounts confirmed_cargo, previous_cargo, published_cargo;
+static struct {
+    uint32_t id, completed_ms;
+    uint8_t pending, event;
+    float angle;
+} feedback;
+static uint8_t delivery_confirmed;
 
-/* ===== 救援夹取状态机 ===== */
-typedef enum {
-    RESCUE_GRAB_WAIT_TEAM = 0,      // 等待队伍颜色设置
-    RESCUE_GRAB_SEARCH,             // 原地旋转搜索目标
-    RESCUE_GRAB_APPROACH_TARGET,    // 视觉闭环接近目标
-    RESCUE_GRAB_CONFIRM_CARGO,      // 夹紧后确认夹持类别和数量
-    RESCUE_GRAB_TARGET_LOST,        // 目标丢失，开启位置环
-    RESCUE_GRAB_APPROACH_ZONE,      // 视觉闭环接近对应投放区
-    RESCUE_GRAB_PRECHECK,           // 投放前预检：记录投放区当前数量作为基线
-    RESCUE_GRAB_PUSH,               // 前推，把目标推进投放区
-    RESCUE_GRAB_VERIFY,             // 验证投放是否成功
-    RESCUE_GRAB_STOP                // 停止模式    
-} RescueGrabState;
-
-/* ============================================================================
- * 主流程状态流转：
- *
- *   WAIT_TEAM（等队伍）
- *        │ 队伍已设置
- *        ▼
- *   SEARCH（旋转找目标）──看到可抓目标──→ APPROACH_TARGET（追目标）
- *        ▲                                      │ 目标 y 足够大（贴到跟前）
- *        │                                      ▼
- *        │                       CONFIRM_CARGO（夹紧并确认类别/数量）
- *        │                         │正确                 │错误/超时
- *        │                         ▼                      └──→ SEARCH
- *        │                  APPROACH_ZONE（找投放区）
- *        │                                      │ 投放区 y 足够大
- *        │                                      ▼
- *        │                                  PRECHECK（记录投放区已有数量）
- *        │                                      │ 连续确认若干帧
- *        │                                      ▼
- *        │                                   PUSH（前推 700ms）
- *        │                                      ▼
- *        └──────────投放成功──────────────── VERIFY（对比数量是否增加）
- *
- * 任一阶段只要视觉里出现"危险物"，都会强制停车并退回 SEARCH。
- * ==========================================================================*/
-
-static volatile uint8_t configured_team = 0U;          // 已设置的队伍：0=未设置，1=蓝，2=红
-static RescueGrabState grab_state = RESCUE_GRAB_WAIT_TEAM;  // 当前状态
-static uint8_t selected_type = MAIXCAM_TARGET_NONE;    // 本轮锁定的目标类型
-static uint8_t first_normal_delivered = 0U;            // 是否已投放过第一个普通物资
-static uint8_t lost_target_ticks = 0U;                 // 目标连续丢失的周期计数
-static uint8_t verify_ticks = 0U;                      // 已验证的视觉帧计数
-static uint8_t cargo_confirm_ticks = 0U;               // 夹持确认通过的连续帧数
-static uint8_t cargo_error_ticks = 0U;                // 夹持确认失败的连续帧数
-static uint8_t confirm_baseline = 0U;                  // 投放前投放区内该类型的数量基线
-static uint8_t confirm_last_sequence = 0U;             // 上一次处理过的帧序号（用于去重）
-static uint8_t confirm_sequence_valid = 0U;            // 帧序号是否有效（1=已有基准可比较）
-static uint32_t state_started_ms = 0U;                 // 当前状态的进入时刻（毫秒）
-static float yaw_total = 0.0f;                        // 总角度（度）
-static uint8_t yaw_full_circle = 0U;                  // 完整圈数
-static uint8_t SEARCH_angle_init = 0U;                // 搜索角度是否已初始化
-static uint8_t lost_mode = 0U;                      // 目标丢失模式
-static uint8_t last_match = 0U;                    // 上一次匹配的目标类型
-static CargoCounts candidate_cargo, previous_cargo, confirmed_cargo;
-
-/* 运输业务规则直接保存在本文件，不依赖导航 count/valid。 */
-typedef enum {
-    CARGO_REJECTED = 0,
-    CARGO_FIRST_NORMAL = 1,
-    CARGO_SINGLE_PATIENT = 2,
-    CARGO_MATERIALS = 3
-} CargoMatch;
-
-static CargoMatch cargo_evaluate(CargoCounts cargo, uint8_t first_delivered)
+static uint32_t lock(void)
 {
-    if (cargo.hazard != 0U) {
-        return CARGO_REJECTED;
-    }
-    if (!first_delivered) {
-        return cargo.normal == 1U && cargo.core == 0U && cargo.patient == 0U
-            ? CARGO_FIRST_NORMAL : CARGO_REJECTED;
-    }
-    if (cargo.patient != 0U) {
-        return cargo.patient == 1U && cargo.normal == 0U && cargo.core == 0U
-            ? CARGO_SINGLE_PATIENT : CARGO_REJECTED;
-    }
-    uint16_t materials = (uint16_t)cargo.normal + cargo.core;
-    return materials >= 1U && materials <= 3U ? CARGO_MATERIALS : CARGO_REJECTED;
+    uint32_t saved = __get_PRIMASK();
+    __disable_irq();
+    return saved;
 }
 
-static uint8_t cargo_counts_equal(CargoCounts a, CargoCounts b)
+static void unlock(uint32_t saved) { __set_PRIMASK(saved); }
+
+static uint8_t vision_fresh(uint32_t now, const MaixcamObservation *v)
+{
+    return v->data.frame_valid && v->data.team == configured_team &&
+           v->data.target_mode == vision_mode &&
+           (uint32_t)(now - v->data.updated_ms) <= GRAB_VISION_TIMEOUT_MS;
+}
+
+static uint8_t navigation_fresh(uint32_t now, const MaixcamNavigation *n)
+{
+    return n->frame_valid && n->frame_id != navigation_baseline &&
+           n->team == configured_team && n->mode == vision_mode &&
+           (uint32_t)(now - n->updated_ms) <= GRAB_VISION_TIMEOUT_MS;
+}
+
+static uint8_t cargo_equal(CargoCounts a, CargoCounts b)
 {
     return a.normal == b.normal && a.core == b.core &&
            a.patient == b.patient && a.hazard == b.hazard;
 }
 
-void calc_circle(float curr_yaw)
+static uint8_t cargo_allowed(CargoCounts c)
 {
-    static float yaw_last = 0.0f;
-    float delta = curr_yaw - yaw_last;
-
-    // 处理0/360跳变
-    if(delta > 180.0f)      // 上一帧接近0，现在接近360，逆时针跨零点
-        delta -= 360.0f;
-    else if(delta < -180.0f)// 上一帧接近360，现在接近0，顺时针跨零点
-        delta += 360.0f;
-
-    yaw_total += delta;
-    // 顺时针一圈 diff ≤ -360；逆时针一圈 diff ≥ +360
-    if( yaw_total >= 360.0f ||  yaw_total<= -360.0f)
-    {
-        yaw_full_circle++;  // 置位一圈标记
-        yaw_total=0;
-    }
-    yaw_last = curr_yaw;
+    if (c.hazard) return 0U;
+    if (!first_normal_delivered)
+        return c.normal == 1U && c.core == 0U && c.patient == 0U;
+    if (c.patient)
+        return c.patient == 1U && c.normal == 0U && c.core == 0U;
+    uint16_t count = (uint16_t)c.normal + c.core;
+    return count >= 1U && count <= 3U;
 }
-/* 切换状态：统一重置各计数器与计时起点，避免上一状态的数据污染新状态 */
-static void enter_state(RescueGrabState state)
+
+static void new_action(GrabAction action, GrabCameraPose pose)
 {
-    grab_state = state;
-    state_started_ms = HAL_GetTick();
-    lost_target_ticks = 0U;
-    verify_ticks = 0U;
-    confirm_sequence_valid = 0U;
-    cargo_confirm_ticks = 0U;
-    cargo_error_ticks = 0U;       // 夹持失败计数不能跨状态残留，否则下次确认会被立刻判失败
-    last_match = 0U;              // 上一次匹配结果清零，重新开始"连续多帧一致"的判断
-    candidate_cargo = (CargoCounts){0};
+    uint32_t next = request.id + 1U;
+    if (next == 0U) next = 1U;
+    memset(&request, 0, sizeof(request));
+    request.id = next;
+    request.action = action;
+    request.camera_pose = pose;
+    request.stage = stage;
+    request.team = configured_team;
+    request.start_position = GRAB_START_POSITION_DEFAULT;
+    request.cargo = confirmed_cargo;
+    execution_failed = 0U;
+    feedback.pending = 0U;
+}
+
+static void ensure_action(GrabAction action, GrabCameraPose pose)
+{
+    if (request.action != action) new_action(action, pose);
+}
+
+static void clear_confirmation(void)
+{
+    good_frames = bad_frames = empty_timing = 0U;
     previous_cargo = (CargoCounts){0};
-    confirm_baseline = 0U;        // 投放区数量基线只在 PRECHECK 重新采样
-    lost_mode = 0U;               // 目标丢失后的去向由新状态重新决定
-    SEARCH_angle_init = 0U;       // 再次进入搜索时重新把云台抬到初始角度
-    yaw_full_circle = 0U;
-    yaw_total = 0.0f;
 }
 
-/* 按目标类型取出视觉回传的对应数量（普通/核心/伤员） */
-static uint8_t target_count_for_type(uint8_t type)
+/* mode=0的实际新帧回显是清除相机跟线历史的屏障。
+ * 不能只发命令就假定相机已处理；需要回显后才重进确认/回基地模式。 */
+static void begin_pose(GrabStage next, GrabCameraPose pose, uint32_t frame_id)
 {
-    switch (type) {
-    case MAIXCAM_TARGET_NORMAL_MATERIAL:
-        return my_car.vision_manager.normal_count;
-    case MAIXCAM_TARGET_CORE_MATERIAL:
-        return my_car.vision_manager.core_count;
-    case MAIXCAM_TARGET_PATIENT:
-        return my_car.vision_manager.patient_count;
-    default:
-        return 0U;
-    }
+    stage = next;
+    vision_mode = MAIXCAM_MODE_OBSERVE;
+    camera_reset_baseline = frame_id;
+    camera_reset_seen = pose_done = 0U;
+    clear_confirmation();
+    can_hold_speed = 0U;
+    new_action(GRAB_ACTION_SET_CAMERA_POSE, pose);
 }
-static uint8_t cargo_matches_selected_target(void)
+
+static void begin_object_pose(uint32_t frame_id)
 {
-    /* 模式9本来就没有导航目标，不能用 target_num/is_valid 判定运输失败。
-     * 这里仍读取现有共享字段；同帧快照与舵机完成反馈需电控侧配套。 */
-    candidate_cargo = (CargoCounts){
-        .normal = my_car.vision_manager.normal_count,
-        .core = my_car.vision_manager.core_count,
-        .patient = my_car.vision_manager.patient_count,
-        .hazard = my_car.vision_manager.hazard_count
-    };
-    return (uint8_t)cargo_evaluate(candidate_cargo, first_normal_delivered);
+    confirmed_cargo = (CargoCounts){0};
+    begin_pose(GRAB_SETTING_OBJECT_POSE, GRAB_POSE_FIND_OBJECT, frame_id);
 }
 
-CargoCounts Grab_GetConfirmedCargo(void)
+static uint8_t object_mode(void)
 {
-    return confirmed_cargo;
+    return first_normal_delivered ? MAIXCAM_MODE_RESCUE_TARGETS : MAIXCAM_MODE_NORMAL_MATERIAL;
 }
 
-/* 目标类型 → 对应的投放区视觉模式（伤员送伤员区，其余送物资区） */
-static uint8_t zone_mode_for_type(uint8_t type)
+static void begin_search(void)
 {
-    if (type == MAIXCAM_TARGET_PATIENT) {
-        return MAIXCAM_MODE_PATIENT_ZONE;
-    }
-    return MAIXCAM_MODE_MATERIAL_ZONE;
+    stage = GRAB_SEARCHING_OBJECT;
+    vision_mode = object_mode();
+    new_action(GRAB_ACTION_SEARCH_OBJECT, GRAB_POSE_FIND_OBJECT);
+    request.suspended = 1U; /* 等待目标模式的新帧，不能沿用观察模式的旧结果。 */
 }
 
-
-/* 投放结果验证：确认目标确实被放进投放区 */
-static void verify_delivery(void)
+static uint8_t object_visible(const MaixcamObservation *v)
 {
-    /* 只要画面里还有危险物，就不算投放成功（可能是危险物混入） */
-    if (my_car.vision_manager.hazard_count != 0U) {
-        return;
-    }
-    /* 投放区内该类型的数量比投放前多 → 说明投进去了 */
-    if (target_count_for_type(selected_type) > confirm_baseline) {
-        if (selected_type == MAIXCAM_TARGET_NORMAL_MATERIAL) {
-            first_normal_delivered = 1U;      // 记录"第一个普通物资已投放"
-        }
-        enter_state(RESCUE_GRAB_SEARCH);      // 回去找下一个目标
-        Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-    }
+    uint8_t type = v->data.target_type;
+    return v->data.is_valid && v->data.target_num &&
+           (type == MAIXCAM_TARGET_NORMAL_MATERIAL ||
+            (first_normal_delivered && (type == MAIXCAM_TARGET_CORE_MATERIAL ||
+                                        type == MAIXCAM_TARGET_PATIENT)));
 }
 
-/* 设置队伍颜色（1=蓝，2=红），同时同步给视觉模块 */
+void Grab_Init(void)
+{
+    uint32_t saved = lock();
+    memset(&request, 0, sizeof(request));
+    memset(&feedback, 0, sizeof(feedback));
+    confirmed_cargo = (CargoCounts){0};
+    first_normal_delivered = start_requested = delivery_confirmed = 0U;
+    pose_done = camera_reset_seen = 0U;
+    MaixcamObservation baseline;
+    Maixcam_GetObservation(&baseline);
+    camera_reset_baseline = baseline.frame_id;
+    last_confirm_frame = navigation_baseline = 0U;
+    can_hold_speed = 0U;
+    clear_confirmation();
+    vision_mode = MAIXCAM_MODE_OBSERVE;
+    stage = GRAB_PREPARING_START;
+    new_action(GRAB_ACTION_PREPARE_START, GRAB_POSE_START);
+    published_request = request;
+    published_cargo = confirmed_cargo;
+    unlock(saved);
+}
+
+void Grab_BindExecutor(GrabActionExecutor executor) { action_executor = executor; }
+
+void Grab_Start(void)
+{
+    uint32_t saved = lock();
+    if (stage == GRAB_WAITING_START) start_requested = 1U;
+    unlock(saved);
+}
+
 void Grab_SetTeam(uint8_t team)
 {
     if (team == 1U || team == 2U) {
@@ -202,448 +174,275 @@ void Grab_SetTeam(uint8_t team)
     }
 }
 
-/* 读取当前队伍设置 */
-uint8_t Grab_GetTeam(void)
+uint8_t Grab_GetTeam(void) { return configured_team; }
+GrabStage Grab_GetStage(void) { return (GrabStage)published_request.stage; }
+uint8_t Grab_GetVisionMode(void) { return vision_mode; }
+uint8_t Grab_IsFirstNormalDelivered(void) { return first_normal_delivered; }
+CargoCounts Grab_GetConfirmedCargo(void)
 {
-    return configured_team;
+    uint32_t saved = lock();
+    CargoCounts out = published_cargo;
+    unlock(saved);
+    return out;
 }
 
-/* ============================================================================
- * 救援夹取任务主体：10ms 周期，按状态机推进
- * ==========================================================================*/
+void Grab_GetActionRequest(GrabActionRequest *out)
+{
+    uint32_t saved = lock();
+    *out = published_request;
+    unlock(saved);
+}
+
+void Grab_ReportAction(uint32_t id, GrabFeedback event, float base_angle_deg)
+{
+    if (event < GRAB_FEEDBACK_DONE || event > GRAB_FEEDBACK_FAILED) return;
+    if (event == GRAB_FEEDBACK_BASE_ALIGNED &&
+        (!isfinite(base_angle_deg) || base_angle_deg < -180.0f || base_angle_deg > 180.0f)) return;
+    uint32_t saved = lock();
+    if (id == published_request.id && (event != GRAB_FEEDBACK_BASE_ALIGNED ||
+        (published_request.action == GRAB_ACTION_FOLLOW_BASE && !published_request.suspended))) {
+        feedback.id = id;
+        feedback.event = event;
+        feedback.completed_ms = HAL_GetTick();
+        feedback.angle = base_angle_deg;
+        feedback.pending = 1U;
+    }
+    unlock(saved);
+}
+
+void Grab_ReportDelivery(uint32_t id, uint8_t delivered)
+{
+    uint32_t saved = lock();
+    if (published_request.stage == GRAB_WAITING_DELIVERY && published_request.id == id && delivered == 1U)
+        delivery_confirmed = 1U;
+    unlock(saved);
+}
+
+void Grab_Process(uint32_t now, const MaixcamObservation *v, const MaixcamNavigation *n)
+{
+    uint8_t event = 0U;
+    float angle = 0.0f;
+    uint32_t completed_ms = 0U;
+    uint32_t saved = lock();
+    if (feedback.pending && feedback.id == request.id) {
+        event = feedback.event;
+        angle = feedback.angle;
+        completed_ms = feedback.completed_ms;
+        feedback.pending = 0U;
+    }
+    unlock(saved);
+    if (event == GRAB_FEEDBACK_FAILED) execution_failed = 1U;
+    else if (event) execution_failed = 0U;
+    request.suspended = execution_failed;
+    /* 执行端失败不能变成业务完成；由执行端恢复后给同id的真实完成反馈。 */
+    if (execution_failed) goto publish;
+
+    uint8_t fresh = vision_fresh(now, v);
+    uint8_t setting_pose = stage == GRAB_PREPARING_START || stage == GRAB_SETTING_OBJECT_POSE ||
+                           stage == GRAB_SETTING_CONFIRM_POSE || stage == GRAB_SETTING_BASE_POSE;
+    if (setting_pose && event == GRAB_FEEDBACK_DONE) {
+        pose_done = 1U;
+        camera_reset_seen = 0U;
+        pose_ready_since_ms = completed_ms;
+    }
+    /* 移动途中收到的模式0回显不能提前记为完成屏障；必须晚于姿态稳定反馈。 */
+    if (setting_pose && pose_done && fresh && v->data.target_mode == MAIXCAM_MODE_OBSERVE &&
+        v->frame_id != camera_reset_baseline &&
+        (int32_t)(v->data.updated_ms - pose_ready_since_ms) > 0)
+        camera_reset_seen = 1U;
+
+    switch (stage) {
+    case GRAB_PREPARING_START:
+        if (pose_done && camera_reset_seen) {
+            stage = GRAB_WAITING_START;
+            new_action(GRAB_ACTION_STOP, GRAB_POSE_START);
+        }
+        break;
+    case GRAB_WAITING_START:
+        if (start_requested) {
+            start_requested = 0U;
+            stage = GRAB_LEAVING_START;
+            new_action(GRAB_ACTION_LEAVE_START, GRAB_POSE_FIND_OBJECT);
+        }
+        break;
+    case GRAB_LEAVING_START:
+        if (event == GRAB_FEEDBACK_DONE) begin_search();
+        break;
+    case GRAB_SETTING_OBJECT_POSE:
+    case GRAB_SETTING_CONFIRM_POSE:
+    case GRAB_SETTING_BASE_POSE:
+        if (!pose_done || !camera_reset_seen) break;
+        if (stage == GRAB_SETTING_OBJECT_POSE) begin_search();
+        else if (stage == GRAB_SETTING_CONFIRM_POSE) {
+            stage = GRAB_CONFIRMING_CARGO;
+            vision_mode = MAIXCAM_MODE_CONFIRM_CARGO;
+            last_confirm_frame = v->frame_id;
+            last_confirm_sequence = v->data.sequence;
+            clear_confirmation();
+            new_action(GRAB_ACTION_STOP, GRAB_POSE_CHECK_CARGO);
+        } else {
+            stage = GRAB_RETURNING_TO_BASE;
+            /* 旧的同模式导航即使仍在150ms窗口内，也不能跨转向/姿态屏障复用。 */
+            navigation_baseline = n->frame_id;
+            vision_mode = confirmed_cargo.patient ? MAIXCAM_MODE_PATIENT_ZONE : MAIXCAM_MODE_MATERIAL_ZONE;
+            new_action(GRAB_ACTION_SEARCH_BASE, GRAB_POSE_FIND_BASE);
+            request.suspended = 1U; /* 新导航观察实际到达后才执行搜索/跟随。 */
+        }
+        break;
+    case GRAB_SEARCHING_OBJECT:
+        request.suspended = !fresh;
+        if (fresh && object_visible(v)) {
+            stage = GRAB_APPROACHING_OBJECT;
+            new_action(GRAB_ACTION_APPROACH_OBJECT, GRAB_POSE_FIND_OBJECT);
+            request.target = *v;
+        }
+        break;
+    case GRAB_APPROACHING_OBJECT:
+        if (event == GRAB_FEEDBACK_DONE) {
+            begin_pose(GRAB_SETTING_CONFIRM_POSE, GRAB_POSE_CHECK_CARGO, v->frame_id);
+        } else if (!fresh) {
+            request.suspended = 1U;
+            memset(&request.target, 0, sizeof(request.target));
+        } else if (!object_visible(v)) begin_search();
+        else request.target = *v;
+        break;
+    case GRAB_CONFIRMING_CARGO:
+        if (!fresh) {
+            clear_confirmation(); /* 断流不是空夹，不能凑足1秒后擅自重选。 */
+            break;
+        }
+        if (v->frame_id != last_confirm_frame) {
+            /* 漏掉了中间帧就不能声称“连续”：数量计数和空夹时间都重新开始。 */
+            if (v->frame_id != last_confirm_frame + 1U ||
+                v->data.sequence != (uint8_t)(last_confirm_sequence + 1U))
+                clear_confirmation();
+            last_confirm_frame = v->frame_id;
+            last_confirm_sequence = v->data.sequence;
+            CargoCounts cargo = {v->data.normal_count, v->data.core_count,
+                                 v->data.patient_count, v->data.hazard_count};
+            if (cargo.normal == 0U && cargo.core == 0U && cargo.patient == 0U && cargo.hazard == 0U) {
+                good_frames = bad_frames = 0U;
+                if (!empty_timing) { empty_timing = 1U; empty_since_ms = now; }
+            } else {
+                empty_timing = 0U;
+                if (cargo_allowed(cargo)) {
+                    good_frames = good_frames && cargo_equal(cargo, previous_cargo) ? good_frames + 1U : 1U;
+                    bad_frames = 0U;
+                } else { good_frames = 0U; ++bad_frames; }
+                previous_cargo = cargo;
+                if (bad_frames >= GRAB_VERIFY_FRAMES) {
+                    stage = GRAB_CLEARING_CARGO;
+                    vision_mode = MAIXCAM_MODE_OBSERVE;
+                    new_action(GRAB_ACTION_CLEAR_AND_SCATTER, GRAB_POSE_CHECK_CARGO);
+                    request.cargo = cargo;
+                } else if (good_frames >= GRAB_VERIFY_FRAMES) {
+                    confirmed_cargo = cargo;
+                    begin_pose(GRAB_SETTING_BASE_POSE, GRAB_POSE_FIND_BASE, v->frame_id);
+                }
+            }
+        }
+        if (stage == GRAB_CONFIRMING_CARGO && empty_timing &&
+            (uint32_t)(now - empty_since_ms) >= GRAB_EMPTY_CONFIRM_MS)
+            begin_object_pose(v->frame_id);
+        break;
+    case GRAB_CLEARING_CARGO:
+        if (event == GRAB_FEEDBACK_DONE) begin_object_pose(v->frame_id);
+        break;
+    case GRAB_RETURNING_TO_BASE:
+        if (!navigation_fresh(now, n)) {
+            can_hold_speed = 0U;
+            request.suspended = 1U;
+            memset(&request.navigation, 0, sizeof(request.navigation));
+            break;
+        }
+        if (n->action == MAIXCAM_NAV_FOLLOW_ZONE || n->action == MAIXCAM_NAV_FOLLOW_SPLIT) {
+            ensure_action(GRAB_ACTION_FOLLOW_BASE, GRAB_POSE_FIND_BASE);
+            request.navigation = *n;
+            can_hold_speed = n->action == MAIXCAM_NAV_FOLLOW_SPLIT;
+            if (event == GRAB_FEEDBACK_BASE_ALIGNED) {
+                if (fabsf(angle) > GRAB_BASE_MAX_ANGLE_DEG) {
+                    stage = GRAB_ADJUSTING_TO_CENTER;
+                    vision_mode = MAIXCAM_MODE_OBSERVE;
+                    new_action(GRAB_ACTION_ADJUST_TO_CENTER, GRAB_POSE_FIND_BASE);
+                    request.base_angle_deg = angle;
+                } else if (n->action == MAIXCAM_NAV_FOLLOW_SPLIT) {
+                    stage = GRAB_WAITING_DELIVERY;
+                    new_action(GRAB_ACTION_WAIT_DELIVERY, GRAB_POSE_FIND_BASE);
+                }
+            }
+        } else if (n->action == MAIXCAM_NAV_HOLD_LAST_SPEED) {
+            uint32_t elapsed = now - n->updated_ms;
+            uint16_t remaining = elapsed < n->hold_remaining_ms ? (uint16_t)(n->hold_remaining_ms - elapsed) : 0U;
+            ensure_action(GRAB_ACTION_HOLD_LAST_SPEED, GRAB_POSE_FIND_BASE);
+            memset(&request.navigation, 0, sizeof(request.navigation));
+            request.hold_remaining_ms = remaining;
+            request.suspended = remaining == 0U || !can_hold_speed;
+            if (!remaining) can_hold_speed = 0U;
+        } else if (n->action == MAIXCAM_NAV_SEARCH_ZONE) {
+            can_hold_speed = 0U;
+            ensure_action(GRAB_ACTION_SEARCH_BASE, GRAB_POSE_FIND_BASE);
+            memset(&request.navigation, 0, sizeof(request.navigation));
+        } else request.suspended = 1U;
+        break;
+    case GRAB_ADJUSTING_TO_CENTER:
+        /* 完成表示本次调整已结束且已转回，不假定一定走够距离；随后重新识别判断。 */
+        if (event == GRAB_FEEDBACK_DONE)
+            begin_pose(GRAB_SETTING_BASE_POSE, GRAB_POSE_FIND_BASE, v->frame_id);
+        break;
+    case GRAB_WAITING_DELIVERY:
+        if (delivery_confirmed) {
+            delivery_confirmed = 0U;
+            /* 唯一解除首件限制的入口：外部真实送达判据，不是动作结束。 */
+            if (confirmed_cargo.normal == 1U && confirmed_cargo.core == 0U &&
+                confirmed_cargo.patient == 0U && confirmed_cargo.hazard == 0U)
+                first_normal_delivered = 1U;
+            begin_object_pose(v->frame_id);
+        }
+        break;
+    default:
+        ensure_action(GRAB_ACTION_STOP, GRAB_POSE_START);
+        break;
+    }
+publish:
+    request.stage = stage;
+    request.team = configured_team;
+    request.start_position = GRAB_START_POSITION_DEFAULT;
+    if (stage != GRAB_CLEARING_CARGO) request.cargo = confirmed_cargo;
+    saved = lock();
+    published_request = request;
+    published_cargo = confirmed_cargo;
+    unlock(saved);
+}
+
 void rescue_grab_task(void *pvParameters)
 {
-    TickType_t last_wake = xTaskGetTickCount();
     (void)pvParameters;
-
-    /* 若头文件里预设了队伍，这里直接应用，省去外部调用 Grab_SetTeam */
-#if (GRAB_TEAM_DEFAULT == 1U) || (GRAB_TEAM_DEFAULT == 2U)
-    Grab_SetTeam(GRAB_TEAM_DEFAULT);
-#endif
-    open_posture();                 // 上电先把夹爪张开
+    TickType_t last_wake = xTaskGetTickCount();
+    Grab_Init();
+    Grab_SetTeam(configured_team);
     motor_set_state(MOTOR_STOP);
-
     for (;;) {
-        uint32_t now = HAL_GetTick();
-        /* 视觉是否新鲜：超时未更新就不采信任何目标信息 */
-        uint8_t vision_fresh = Maixcam_IsFresh(GRAB_VISION_TIMEOUT_MS);
-        uint8_t target_valid = vision_fresh && my_car.vision_manager.is_valid;
-        /* 蓝牙手动模式优先：此时状态机完全不碰电机，避免把 A 命令设好的状态覆盖掉 */
+        /* 保留原有手动控制优先级；执行适配也必须遵守底层手动/保护仲裁。 */
         if (bluetooth_work && HC05_InManualMode()) {
             vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(GRAB_TASK_PERIOD_MS));
             continue;
         }
-        /* 碰撞保护：检测与恢复都在 motor_task 里完成（motor_task 独占电机），
-         * 这里只负责在碰撞期间跳过状态机，避免继续下发运动指令。 */
-        if (collision_guard_blocked()) {
-            motor_set_state(MOTOR_STOP);
-            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(GRAB_TASK_PERIOD_MS));
-            continue;
-        }
-
-        /* 危险物熔断：除等待/搜索/预检/验证外，任何阶段看到危险物都立即放弃当前动作 */
-        // if (vision_fresh && my_car.vision_manager.hazard_count != 0U &&
-        //     grab_state != RESCUE_GRAB_WAIT_TEAM &&
-        //     grab_state != RESCUE_GRAB_SEARCH &&
-        //     grab_state != RESCUE_GRAB_PRECHECK &&
-        //     grab_state != RESCUE_GRAB_VERIFY) {
-        //     motor_set_state(MOTOR_STOP);
-        //     command_search_mode();
-        //     enter_state(RESCUE_GRAB_SEARCH);
-        // }
-
-        switch (grab_state) {
-        /* --- 等待队伍颜色：没设置就原地停着 --- */
-        case RESCUE_GRAB_WAIT_TEAM:
-            motor_set_state(MOTOR_STOP);
-            if (configured_team == 1U || configured_team == 2U) {
-                (void)Maixcam_SetTeam(configured_team);
-                Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                enter_state(RESCUE_GRAB_SEARCH);
-            }
-            break;
-
-        /* --- 搜索：原地旋转，等待视觉给出可抓目标 --- */
-        case RESCUE_GRAB_SEARCH:
-            if (SEARCH_angle_init==0) {
-                set_vision_angle(ccr_2_max);
-                SEARCH_angle_init=1;
-            }
-            if(first_normal_delivered == 0U)
-            {
-                Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-                my_car.speed_manager.y_target = GRAB_APPROACH_Y;
-                /* 视觉失效，或视觉端还没切到搜索模式 → 先停着等 */
-                if (!vision_fresh || my_car.vision_manager.target_mode != MAIXCAM_MODE_NORMAL_MATERIAL) {
-                    motor_set_state(MOTOR_STOP);
-                    break;
-                }
-            }
-            else
-            {
-                Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-                my_car.speed_manager.y_target = GRAB_APPROACH_Y;
-                /* 视觉失效，或视觉端还没切到搜索模式 → 先停着等 */
-                if (!vision_fresh || my_car.vision_manager.target_mode != MAIXCAM_MODE_RESCUE_TARGETS) {
-                    motor_set_state(MOTOR_STOP);
-                    break;
-                }   
-            }
-            /* 画面里有危险物 → 不追，原地停 */
-            // if (my_car.vision_manager.hazard_count != 0U) {
-            //     motor_set_state(MOTOR_STOP);
-            //     break;
-            // }
-            if (target_valid) {
-                motor_set_state(MOTOR_STOP);
-                /* 锁定当前看到的目标类型，进入"接近目标"状态 */
-                selected_type = my_car.vision_manager.target_type;
-                // if(selected_type == MAIXCAM_TARGET_PATIENT)
-                // {
-                //     Set_Vision_Mode(MAIXCAM_MODE_PATIENT);
-                // }
-                // else if(selected_type == MAIXCAM_TARGET_CORE_MATERIAL)
-                // {
-                //     Set_Vision_Mode(MAIXCAM_MODE_CORE_MATERIAL);
-                // }
-                // else if(selected_type == MAIXCAM_TARGET_NORMAL_MATERIAL)
-                // {
-                //     Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                // }
-                if(first_normal_delivered == 0U)
-                {
-                    Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                }
-                else
-                {
-                    Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                }
-                enter_state(RESCUE_GRAB_APPROACH_TARGET);   
-            } else {
-                motor_set_state(MOTOR_SEARCH_TARGET);   // 没有合适目标 → 继续旋转搜索
-                calc_circle(my_car.angle_manager.yaw);
-                if(yaw_full_circle >= 2U)
-                {
-                    yaw_full_circle = 0;
-                    uint16_t find_angle_target = rudder_cur_ccr[2] + 2;
-                    set_vision_angle(find_angle_target);
-                    if (find_angle_target > 180) {
-                    // 压到 180° 仍无球，才承认找不到，转去找交叉线
-                        find_angle_target = 180;
-                        SEARCH_angle_init=0;//
-                        set_vision_angle(find_angle_target);
-                        enter_state(RESCUE_GRAB_TARGET_LOST);
-                        lost_mode = 1U;     // enter_state 会清标志位，必须在它之后再赋值
-                    }
-                }
-            }
-            break;
-
-        case RESCUE_GRAB_TARGET_LOST:
-            switch (lost_mode) {
-                case 0U: my_car.pose_manager.target_x = CENTER_X;
-                         my_car.pose_manager.target_y = CENTER_Y;
-                    break;
-                case 1U: my_car.pose_manager.target_x = CENTER_X;
-                         my_car.pose_manager.target_y = CENTER_Y;
-                    break;
-                case 2U: my_car.pose_manager.target_x = ZONE_X;
-                         my_car.pose_manager.target_y = PATIENT_ZONE_Y;       
-                    break;
-                case 3U: my_car.pose_manager.target_x = ZONE_X;
-                         my_car.pose_manager.target_y = MATERIAL_ZONE_Y;
-                    break;
-                default: break;
-            }
-            my_car.pose_manager.finished =0;
-            motor_set_state(MOTOR_POSITION);
-            while(my_car.pose_manager.finished == 0);
-            if(my_car.pose_manager.finished)
-            {
-                enter_state(RESCUE_GRAB_SEARCH);
-            }
-            break;
-        /* --- 接近目标：视觉闭环追踪，贴到足够近为止 --- */
-        case RESCUE_GRAB_APPROACH_TARGET:
-            if(first_normal_delivered == 0U)
-            {
-                Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-                my_car.speed_manager.y_target = GRAB_APPROACH_Y;
-                /* 视觉失效，或视觉端还没切到搜索模式 → 先停着等 */
-                if (!vision_fresh || my_car.vision_manager.target_mode != MAIXCAM_MODE_NORMAL_MATERIAL) {
-                    motor_set_state(MOTOR_STOP);
-                    break;
-                }
-            }
-            else
-            {
-                Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-                my_car.speed_manager.y_target = GRAB_APPROACH_Y;
-                /* 视觉失效，或视觉端还没切到搜索模式 → 先停着等 */
-                if (!vision_fresh || my_car.vision_manager.target_mode != MAIXCAM_MODE_RESCUE_TARGETS) {
-                    motor_set_state(MOTOR_STOP);
-                    break;
-                }   
-            }
-            /* 目标丢失，或目标类型变了（比如换成了别的东西） */
-            if (!target_valid) {
-                 if (++lost_target_ticks >= GRAB_LOST_TARGET_TICKS) {   // 连续丢失超时 → 放弃
-                     motor_set_state(MOTOR_STOP);
-                     Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                     enter_state(RESCUE_GRAB_SEARCH);
-                 }
-                 break;
-             }
-            lost_target_ticks = 0U;                 // 本帧看到目标，丢失计数清零
-            my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-            my_car.speed_manager.y_target = GRAB_APPROACH_Y;
-            motor_set_state(MOTOR_TRACK_TARGET);    // 视觉 x/y 双 PID 闭环前进
-            /* 到达抓取距离后停车夹紧，再进入独立的夹持确认状态。 */
-            if (my_car.vision_manager.y > 155 && rudder_cur_ccr[2] < ccr_2_min)
-                {
-                    uint16_t new_target = rudder_cur_ccr[2] + 1;
-                    if (new_target > ccr_2_min)
-                        new_target = ccr_2_min;
-                    set_vision_angle(new_target);
-                }
-                // 开爪预动作：球进入水平中心区、y>85、舵机已压到 145° 以上 → 提前张爪
-                if(my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && my_car.vision_manager.y > 85 && rudder_cur_ccr[2] >= 145 ){
-                    open_posture();
-                }
-                // 夹取判定（双重条件互印证：球在画面里"够近" 且 舵机确实"够低"）
-                // 条件A：y>170 且 舵机>=175
-                // 条件B：舵机>=190（到底） 且 y>160
-                if(my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && ((my_car.vision_manager.y > 170 && rudder_cur_ccr[2] >=175)||(rudder_cur_ccr[2] >=190&&my_car.vision_manager.y>160 ))){  //185 170
-                    motor_set_pwm(1,50);      // 慢速再蹭一小段，确保夹爪位置到位
-                    motor_set_pwm(2,50);
-                    my_delay_ms(150);
-                    grab_posture();           // 合爪
-                    enter_state(RESCUE_GRAB_CONFIRM_CARGO);
-                }
-            // if (my_car.vision_manager.y >= GRAB_TARGET_NEAR_Y) {
-            //     motor_set_state(MOTOR_STOP);
-            //     open_posture();
-
-            //     my_delay_ms(100);
-            //     grab_posture();
-            //     Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
-            //     enter_state(RESCUE_GRAB_CONFIRM_CARGO);
-            // }
-            break;
-
-        /* --- 夹持确认：只统计确认 ROI 的类别数，连续多帧正确才继续 --- */
-        case RESCUE_GRAB_CONFIRM_CARGO:
-            motor_set_state(MOTOR_STOP);
-            set_vision_angle(ccr_2_max);
-            my_delay_ms(500);
-            grab_posture();                    // 确认期间保持夹紧，避免物品掉落
-            Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
-            if (vision_fresh && my_car.vision_manager.target_mode == MAIXCAM_MODE_CONFIRM_CARGO &&
-                (!confirm_sequence_valid || my_car.vision_manager.sequence != confirm_last_sequence)) {
-                confirm_last_sequence = my_car.vision_manager.sequence;
-                confirm_sequence_valid = 1U;
-                uint8_t cur_match = cargo_matches_selected_target();
-                if (cur_match != CARGO_REJECTED) {
-                    /* 类别或数量变化都从当前第1帧重新计数，不能只比较“物资类”。 */
-                    if (last_match == cur_match && cargo_counts_equal(candidate_cargo, previous_cargo)) {
-                        cargo_confirm_ticks++;
-                    } else {
-                        cargo_confirm_ticks = 1U;
-                    }
-                    cargo_error_ticks = 0U;
-                } 
-                else {
-                    cargo_confirm_ticks = 0U;
-                    cargo_error_ticks++;
-                }
-                last_match = cur_match;
-                previous_cargo = candidate_cargo;
-                if(cargo_error_ticks >= GRAB_VERIFY_FRAMES)
-                {
-                    open_big_posture();                 // 大张口
-                    motor_set_state(MOTOR_BACKWARD);
-                    my_delay_ms(500);                   // 后退把球丢掉
-                    motor_set_state(MOTOR_STOP);
-                    grab_posture();       
-                    motor_set_state(MOTOR_FORWARD);
-                    my_delay_ms(700);
-                    motor_set_state(MOTOR_BACKWARD);
-                    my_delay_ms(300);
-                    enter_state(RESCUE_GRAB_SEARCH);
-                    break;
-                }
-                if (cargo_confirm_ticks >= GRAB_VERIFY_FRAMES)
-                {
-                    confirmed_cargo = candidate_cargo;
-                    selected_type = confirmed_cargo.patient != 0U ? MAIXCAM_TARGET_PATIENT :
-                                    confirmed_cargo.core != 0U ? MAIXCAM_TARGET_CORE_MATERIAL :
-                                    MAIXCAM_TARGET_NORMAL_MATERIAL;
-                    cargo_confirm_ticks = 0U;
-                    Set_Vision_Mode(zone_mode_for_type(selected_type));
-                    enter_state(RESCUE_GRAB_APPROACH_ZONE);
-                }
-            }
-            break;
-
-        /* --- 接近投放区：先找到投放区，再闭环靠近 --- */
-        case RESCUE_GRAB_APPROACH_ZONE:
-            my_car.pose_manager.finished=0;
-            my_car.angle_manager.target_yaw = 180;
-            my_car.pose_manager.target_x = my_car.pose_manager.x;
-            my_car.pose_manager.target_y = CENTER_Y;
-            motor_set_state(MOTOR_POSITION);
-            while(my_car.pose_manager.finished == 0);
-            set_vision_angle(ccr_2_max);
-            Set_Vision_Mode(zone_mode_for_type(selected_type));
-            if (!vision_fresh || my_car.vision_manager.target_mode != zone_mode_for_type(selected_type)) {
-                motor_set_state(MOTOR_STOP);
-                break;
-            }
-            if (!target_valid) {                    // 还没看到投放区
-                motor_set_state(MOTOR_SEARCH_TARGET);   // 原地旋转继续找
-                calc_circle(my_car.angle_manager.yaw);
-                if(yaw_full_circle >= 2U)
-                {
-                    enter_state(RESCUE_GRAB_TARGET_LOST);   // 先切状态（会清标志），再决定去向
-                    if(my_car.vision_manager.target_type == MAIXCAM_MODE_PATIENT_ZONE)
-                    lost_mode = 2U;
-                    else if(my_car.vision_manager.target_type == MAIXCAM_MODE_MATERIAL_ZONE)
-                    lost_mode = 3U;
-                }
-                break;
-            }
-            if(my_car.vision_manager.x < 105 )
-            {
-                my_car.pose_manager.target_x = -1;
-                my_car.pose_manager.target_y = -1;
-                my_car.angle_manager.target_yaw = 90;
-                my_car.pose_manager.finished=0;
-                motor_set_state(MOTOR_POSITION);
-                while(my_car.pose_manager.finished == 0);
-                my_car.angle_manager.target_yaw = 180;
-                break;
-            }
-            if(my_car.vision_manager.x > 145)
-            {
-                my_car.pose_manager.target_x = -1;
-                my_car.pose_manager.target_y = -1;
-                my_car.angle_manager.target_yaw = -90;
-                my_car.pose_manager.finished=0;
-                motor_set_state(MOTOR_POSITION);
-                while(my_car.pose_manager.finished == 0);
-                my_car.angle_manager.target_yaw = 180;
-                break;
-            }
-            my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-            my_car.speed_manager.y_target = GRAB_ZONE_APPROACH_Y;
-            motor_set_state(MOTOR_TRACK_TARGET);    // 闭环靠近投放区
-            /* 已经到达投放位置 → 准备预检 */
-            if (my_car.vision_manager.y >= GRAB_ZONE_NEAR_Y) {
-                motor_set_state(MOTOR_STOP);
-                //Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
-                //enter_state(RESCUE_GRAB_PRECHECK);
-                enter_state(RESCUE_GRAB_PUSH);
-            }
-            break;
-        /* --- 前推：一段固定时长的开环前进，把目标推进投放区 --- */
-        case RESCUE_GRAB_PUSH:
-            if(selected_type == MAIXCAM_TARGET_PATIENT)
-                my_car.angle_manager.target_yaw = 150;
-            else
-            {
-                my_car.angle_manager.target_yaw = -150;
-            }
-            my_car.pose_manager.finished=0;
-            motor_set_state(MOTOR_POSITION);
-            while(my_car.pose_manager.finished == 0);
-            motor_set_state(MOTOR_FORWARD);
-            my_delay_ms(500);
-            motor_set_state(MOTOR_STOP);
-            open_posture();
-            my_delay_ms(100);
-            grab_posture();
-            motor_set_state(MOTOR_BACKWARD);
-            my_delay_ms(500);
-            motor_set_state(MOTOR_STOP);
-            if(first_normal_delivered == 0U)
-                first_normal_delivered = 1U;
-            enter_state(RESCUE_GRAB_SEARCH);
-            break;
-        /* --- 预检：在投放前记录投放区已有的该类型数量，作为验证基线 --- */
-        case RESCUE_GRAB_PRECHECK:
-            motor_set_state(MOTOR_STOP);
-            Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
-            /* 只处理"新的一帧"（帧序号变化），避免同一帧被重复计数 */
-            if (vision_fresh && my_car.vision_manager.target_mode == MAIXCAM_MODE_CONFIRM_CARGO &&
-                (!confirm_sequence_valid ||
-                 my_car.vision_manager.sequence != confirm_last_sequence)) {
-                confirm_last_sequence = my_car.vision_manager.sequence;
-                confirm_sequence_valid = 1U;
-                if (++verify_ticks >= GRAB_VERIFY_FRAMES) {
-                    confirm_baseline = target_count_for_type(selected_type);   // 记录基线
-                    enter_state(RESCUE_GRAB_PUSH);
-                }
-            }
-            /* 预检超时 → 放弃本次投放 */
-            if ((uint32_t)(now - state_started_ms) >= GRAB_VERIFY_TIMEOUT_MS) {
-                if(first_normal_delivered == 0U)
-                    Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                else
-                    Set_Vision_Mode(MAIXCAM_MODE_PATIENT);
-                enter_state(RESCUE_GRAB_SEARCH);
-            }
-            break;
-
-        /* --- 验证：观察投放区数量是否增加，判断投放是否成功 --- */
-        case RESCUE_GRAB_VERIFY:
-            motor_set_state(MOTOR_STOP);
-            Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
-            if (vision_fresh && my_car.vision_manager.target_mode == MAIXCAM_MODE_CONFIRM_CARGO &&
-                (!confirm_sequence_valid ||
-                 my_car.vision_manager.sequence != confirm_last_sequence)) {
-                confirm_last_sequence = my_car.vision_manager.sequence;
-                confirm_sequence_valid = 1U;
-                if (verify_ticks < GRAB_VERIFY_FRAMES) {
-                    verify_ticks++;                 // 继续累积验证帧数
-                }
-                if (verify_ticks >= GRAB_VERIFY_FRAMES) {
-                    verify_delivery();              // 帧数够了 → 判定是否投放成功
-                    /* 仍未成功（verify_delivery 没有切状态）且已超时 → 放弃重来 */
-                    if (grab_state == RESCUE_GRAB_VERIFY &&
-                        (uint32_t)(now - state_started_ms) >= GRAB_VERIFY_TIMEOUT_MS) {
-                        if(first_normal_delivered == 0U)
-                        Set_Vision_Mode(MAIXCAM_MODE_NORMAL_MATERIAL);
-                        else
-                         Set_Vision_Mode(MAIXCAM_MODE_PATIENT);
-                        enter_state(RESCUE_GRAB_SEARCH);
-                    }
-                }
-            }
-            break;
-
-        /* --- 停止 / 非法状态 --- */
-        case RESCUE_GRAB_STOP:
-        default:
-            motor_set_state(MOTOR_STOP);
-            break;
-        }
-
-        /* 固定 10ms 周期 */
+        MaixcamObservation vision;
+        MaixcamNavigation navigation;
+        Maixcam_GetObservation(&vision);
+        Maixcam_GetNavigation(&navigation);
+        Grab_Process(HAL_GetTick(), &vision, &navigation);
+        (void)Maixcam_SendCommand(vision_mode, configured_team);
+        GrabActionRequest current;
+        Grab_GetActionRequest(&current);
+        if (action_executor) action_executor(&current);
+        else motor_set_state(MOTOR_STOP); /* 未接动作端，不自动启动旧控制流程。 */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(GRAB_TASK_PERIOD_MS));
     }
 }
 
-/* 创建救援夹取任务 */
 void rescue_grab_task_create(void)
 {
-    xTaskCreate((TaskFunction_t)rescue_grab_task,     // 任务入口
-                (const char *)"rescue_grab",           // 任务名称
-                (uint32_t)grab_size,                   // 堆栈大小
-                (void *)NULL,                          // 传给任务的参数
-                (UBaseType_t)grab_task_priority,       // 优先级
-                (TaskHandle_t *)&rescue_grab_handler); // 任务句柄
+    xTaskCreate((TaskFunction_t)rescue_grab_task, "rescue_grab", (uint32_t)grab_size,
+                NULL, (UBaseType_t)grab_task_priority, &rescue_grab_handler);
 }
