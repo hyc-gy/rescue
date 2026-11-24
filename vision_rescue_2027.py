@@ -126,10 +126,11 @@ TYPE_BY_LABEL = {
     "PATIENT": TargetType.PATIENT,
     "NORMAL_MATERIAL": TargetType.NORMAL_MATERIAL,
 }
+# 选物优先级为检测框面积乘权重；浅蓝危险物在 allowed_types 中排除，不参与排序。
 MATERIAL_AREA_WEIGHTS = {
     TargetType.NORMAL_MATERIAL: 1.0,
     TargetType.CORE_MATERIAL: 3.0,
-    TargetType.PATIENT: 0.5,
+    TargetType.PATIENT: 1.8,
 }
 # 场地区域使用模型标签判断，不借用旧协议中的“物资区/伤员区”编号。
 ZONE_LABELS = ("Blue_Zone", "Red_Zone")
