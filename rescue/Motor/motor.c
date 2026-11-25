@@ -64,13 +64,13 @@ void pid_init(void){
 
     MOTOR_PWM_MAX = (int32_t)(htim12.Instance->ARR * MAX_SPEED_rate);
     // 增量式 PID（电机内环），带抗积分饱和
-    L0_param.kp = 30;//60
-    L0_param.ki = 0.8f;//10
+    L0_param.kp = 57;//24;//60
+    L0_param.ki = 5.0;//0.8f;//10
     L0_param.kd = 0.12f;//5
     L0_param.outputMax = MOTOR_PWM_MAX;
 
-    R0_param.kp = 30;//60
-    R0_param.ki = 0.8f;//10
+    R0_param.kp = 57;//24;//60
+    R0_param.ki = 5.0;//0.8f;//10
     R0_param.kd = 0.12f;//5
     R0_param.outputMax = MOTOR_PWM_MAX;
 
@@ -325,9 +325,9 @@ void motor_task(void *pvParameters){
         /* 碰撞恢复期间由 motor_task 独占电机，跳过正常控制 */
         if(++cnt==10)
         {
-            //HC05_Printf("%d\n",(int16_t)(100*my_car.angle_manager.yaw));
-            HC05_Printf("%d,%d,%d\n",
-             (int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),(int)(100*my_car.pose_manager.y));
+            HC05_Printf("%d,%d\n",(int16_t)(motor_L0.measure),(int16_t)(motor_R0.measure));
+
+            //HC05_Printf("%d,%d,%d\n",(int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),(int)(100*my_car.pose_manager.y));
             cnt =0;
         }
         if (collision_recover_step(HAL_GetTick())) {
@@ -412,8 +412,8 @@ void motor_task(void *pvParameters){
             case MOTOR_FORWARD:
                 motor_set_pwm(1,500);
                 motor_set_pwm(2,500);
-                //motor_set_pwm(3,200);
-                //motor_set_pwm(4,200);
+                //motor_set_pwm(3,500);
+                //motor_set_pwm(4,500);
                 break;
             case MOTOR_POSITION:
                 float turn_speed = 0;

@@ -28,7 +28,7 @@ void rudder_init(void){
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_3);
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_4);
-    rudder_cur_ccr[1] = 140;      // 夹爪初始：合拢
+    rudder_cur_ccr[1] = 130;      // 夹爪初始：合拢
     rudder_cur_ccr[2] = 135;     // 云台初始：抬到最高
     TIM1->CCR1 = rudder_cur_ccr[1];
     TIM1->CCR2 = rudder_cur_ccr[2];
@@ -79,17 +79,17 @@ void Set_Rudder_Mode(uint8_t mode){
 
 /* 夹取：夹爪合紧（34 为最紧位置，直接写寄存器、无缓动） */
 void grab_posture(void){
-    TIM1->CCR1 = 140;
+    TIM1->CCR1 = 130;
 }
 
 /* 张开：夹爪打开到中等开口，用于抓取前准备 */
 void open_posture(void){
-    TIM1->CCR1 = 170;
+    TIM1->CCR1 = 165;
 }
 
 /* 大张：夹爪开到最大，用于把误夹的目标丢掉 */
 void open_big_posture(void){
-    TIM1->CCR1 = 173;
+    TIM1->CCR1 = 167;
 }
 
 /* ============================================================================
