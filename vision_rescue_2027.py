@@ -16,7 +16,8 @@ mode: 0全部观察，1普通物资，2核心物资，3伤员，4保留（不再
       6己方伤员区，7全部救援目标（普通物资+核心物资+伤员），
       8混合物资（普通物资+核心物资），9运输物品确认。
 team: 0未配置，1蓝方，2红方。type取 TargetType，0=未发现。
-count是当前模式可见数量，不是载荷数、完成数或允许一次搬运数量。
+count在模式9表示确认范围内普通物资+核心物资+伤员的数量合计，不含危险物；
+其他模式表示筛选后的导航候选数量。它不是累计送达数或允许一次搬运数量。
 危险物永不参与目标选择及count；普通物资、核心物资、伤员也另行分类统计。
 搜索模式(mode 0-8)的目标总数、三类数量及hazard_count均只统计SEARCH_ROI内目标中心。
 确认模式(mode 9)只统计CONFIRM_ROI；三类物品要求检测框完整在区域内，
@@ -29,7 +30,7 @@ valid只表示本帧存在检测目标，不表示转运合法或已经送达。
 首次只运一个普通物资、伤员单独一个、物资最多三个等由STM32任务管理。
 建议阶段：首次用mode=1；首次普通物资送达确认后用mode=7搜寻下一目标；
 选定物资后可用mode=8补充物资，选定伤员后用mode=3单独转运。
-物资按类别加权后的检测框面积选目标，count为过滤后的可见候选数量。
+物资按类别加权后的检测框面积选目标；模式9不选导航目标，独立回传三类数量合计。
 安全区/分界线的本地预览不复用旧半区类型号；配套STM32修改前不回传这些导航框。
 mode=7不允许物资与伤员混运；mode=8不自动限制载荷为三个。
 
@@ -50,7 +51,7 @@ import struct   # 协议帧的二进制打包/解包，统一使用网络字节�
 # 1) 可调参数
 # ============================================================================
 
-MODEL_PATH = "/root/models/rescue_2027/model.mud"
+MODEL_PATH = "/root/models/rescue_2027/model_332145.mud"
 # 必须与模型内置标签顺序严格一致。语义由训练数据决定，颜色仅为初赛提示。
 # class_id 是模型标签下标；协议 type 使用下方 TYPE_BY_LABEL 的固定映射。
 LABELS = (
@@ -155,7 +156,7 @@ VALID_MODES = (0, 1, 2, 3, 5, 6, 7, 8, 9)
 # 4不可用；例如只调蓝方回物资区，填写 INITIAL_MODE=5、INITIAL_TEAM=1。
 # 注意：这两项是启动初值；收到 STM32 的有效模式/队伍命令后，仍会采用命令值。
 # 本轮先调蓝方、1号位；出发位对应的起步动作由主控执行，不占用Mode模式号。
-INITIAL_MODE = 0  # 按上表填写当前要调试的模式。
+INITIAL_MODE = 9  # 默认启动为夹内物品数量确认；收到有效STM32命令后按主控模式运行。
 INITIAL_TEAM = 1  # 当前默认蓝方；后续手动改红方时填2。
 
 
@@ -460,6 +461,7 @@ def result_packet(sequence, mode, team, target, count, cargo_counts):
     正文字段顺序：version,seq,mode,team,type,count,
                   hazard,normal,core,patient,cx,cy,w,h,score,valid
     其中坐标/宽高为图像像素（大端 uint16），score 为 0~100 的百分比。
+    模式9的count为确认范围内普通+核心+伤员数量合计；无导航目标时valid和框仍为0。
     """
     # 无导航目标时清零目标字段，独立类别数量仍照常发送。
     kind = x = y = w = h = score = valid = 0
@@ -471,8 +473,12 @@ def result_packet(sequence, mode, team, target, count, cargo_counts):
         score = max(0, min(100, int(target.score * 100)))
         valid = 1
     else:
-        # 没有目标时 count 必须清零，不能把“候选数量”误当成有效目标数
+        # 无导航目标时清零候选数；模式9的确认总数在下方单独填写。
         count = 0
+    if mode == Mode.CONFIRM_CARGO:
+        # 适配STM32的target_num：确认总数不依赖导航目标，危险物仍单独计数。
+        count = min(255, sum(cargo_counts[k] for k in (
+            TargetType.NORMAL_MATERIAL, TargetType.CORE_MATERIAL, TargetType.PATIENT)))
     # 按固定顺序打包四类数量：危险物、普通物资、核心物资、伤员
     body = struct.pack(RESULT_FMT, VERSION, sequence & 255, mode, team,
                        kind, count,
@@ -519,15 +525,15 @@ def format_debug_status(mode, team, source, navigation, target, count, cargo_cou
         detail = "%s，中心=(%.1f,%.1f)，宽高=(%.1f,%.1f)，置信度=%.2f" % (
             LABEL_NAMES_CN[LABELS[target.class_id]], target.x + target.w / 2,
             target.y + target.h / 2, target.w, target.h, target.score)
-    text = "[视觉状态] 队伍=%s；模式=%d（%s）；配置来源=%s；当前=%s；目标=%s" % (
+    text = "[视觉状态] 队伍=%s；模式=%d（%s）；配置来源=%s\n当前=%s；目标=%s" % (
         TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode], source, state, detail)
     if returning:
-        text += "；分界线确认=%d/%d帧；漏检保持剩余=%d毫秒" % (
+        text += "\n分界线确认=%d/%d帧；漏检保持剩余=%d毫秒" % (
             navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES, navigation["hold_remaining_ms"])
         text += "；导航数据已交发送适配，接收执行待核对" if navigation_connected else "；导航发送适配未接入，仅本地判断"
     else:
         text += "；可选目标=%d" % count
-    return text + "；范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
+    return text + "\n范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
         cargo_counts[TargetType.NORMAL_MATERIAL], cargo_counts[TargetType.CORE_MATERIAL],
         cargo_counts[TargetType.PATIENT], cargo_counts[TargetType.HAZARD])
 
@@ -572,15 +578,21 @@ def main(navigation_sender=None):
     config_source = "代码固定配置"
     last_log_key = None
     last_log_ms = 0
+    # 仅供MaixVision诊断：TX是写入尝试次数，write=24不代表STM32已收到。
+    tx_attempts = tx_errors = rx_bytes = accepted_commands = 0
+    last_rx = b""
 
     while not app.need_exit():
         # --- 1) 接收 STM32 命令：一次 read 可能包含多条，只保留最后一条有效命令 ---
         chunk = serial.read(256)
         if chunk:
+            rx_bytes += len(chunk)
+            last_rx = bytes(chunk[-32:])
             for command_mode, command_team in parser.feed(chunk):
                 # 帧格式仍兼容team=0，但不让未配置命令覆盖启动前选好的队伍。
                 # 模式和队伍一起采用，避免只改模式却误用另一队伍。
                 if command_team in TEAM_ZONE_LABELS:
+                    accepted_commands += 1
                     if config_source != "STM32主控命令" or (mode, team) != (command_mode, command_team):
                         print("[主控命令] %s，模式%d（%s） → %s，模式%d（%s）" % (
                             TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode],
@@ -613,19 +625,37 @@ def main(navigation_sender=None):
                                          require_full_box=mode == Mode.CONFIRM_CARGO)
 
         # --- 4) 回传结果帧，并递增 8 位帧序号（STM32 用它去重） ---
-        serial.write(result_packet(sequence, mode, team, target, count, cargo_counts))
+        packet = result_packet(sequence, mode, team, target, count, cargo_counts)
+        written = serial.write(packet)
+        tx_attempts += 1
+        if written != len(packet):
+            tx_errors += 1
         navigation["sequence"] = sequence
         if navigation_sender is not None:
             navigation_sender(serial, navigation)
         sequence = (sequence + 1) & 255
+
+        if mode == Mode.CONFIRM_CARGO:
+            # 模式9逐帧短日志：读取本次实际发送报文，不能把相机帧数当成主控确认次数。
+            print("[CONFIRM] t=%d seq=%d N=%d C=%d P=%d H=%d num=%d write=%d/24" % (
+                observed_ms, packet[3], packet[9], packet[10], packet[11], packet[8], packet[7], written), flush=True)
 
         # 日志使用标准输出供MaixVision查看，不向STM32串口写入中文文本。
         # 模式、队伍、来源或导航状态变化立即打印；坐标/计数按时间间隔刷新，避免逐帧刷屏。
         log_key = (mode, team, config_source, navigation["action"])
         if log_key != last_log_key or observed_ms - last_log_ms >= LOG_INTERVAL_MS:
             selected = zone_target if context is not None else target
-            print(format_debug_status(mode, team, config_source, navigation,
-                                      selected, count, cargo_counts, navigation_sender is not None), flush=True)
+            # 长中文摘要分行独立输出，降低MaixVision在传输分块处拆断UTF-8字符的风险。
+            summary = format_debug_status(mode, team, config_source, navigation,
+                                          selected, count, cargo_counts, navigation_sender is not None)
+            for line in summary.splitlines():
+                print(line, flush=True)
+            # 实际送入UART的报文；与视觉摘要共用节流，不逐帧刷屏。
+            print("[UART] TX=%d err=%d write=%d/%d RX=%d CMD=%d seq=%d num=%d" % (
+                tx_attempts, tx_errors, written, len(packet), rx_bytes, accepted_commands, packet[3], packet[7]), flush=True)
+            print("[UART-TX] " + packet.hex(), flush=True)
+            if last_rx:
+                print("[UART-RX last32] " + last_rx.hex(), flush=True)
             last_log_key, last_log_ms = log_key, observed_ms
 
         # --- 5) 本地调试绘图：命中目标画绿框，其余画红框，并标出 ROI ---
