@@ -64,13 +64,13 @@ void pid_init(void){
 
     MOTOR_PWM_MAX = (int32_t)(htim12.Instance->ARR * MAX_SPEED_rate);
     // 增量式 PID（电机内环），带抗积分饱和
-    L0_param.kp = 57;//24;//60
-    L0_param.ki = 5.0;//0.8f;//10
+    L0_param.kp = 24;//57;//24;//60
+    L0_param.ki = 0.8;//5.0;//0.8f;//10
     L0_param.kd = 0.12f;//5
     L0_param.outputMax = MOTOR_PWM_MAX;
 
-    R0_param.kp = 57;//24;//60
-    R0_param.ki = 5.0;//0.8f;//10
+    R0_param.kp = 24;//57;//24;//60
+    R0_param.ki = 0.8;//5.0;//0.8f;//10
     R0_param.kd = 0.12f;//5
     R0_param.outputMax = MOTOR_PWM_MAX;
 
@@ -85,17 +85,17 @@ void pid_init(void){
     R1_param.outputMax = MOTOR_PWM_MAX;
 
     // 左右（横向偏差）
-    Vision_x_pid_param.kp=0.1f;//0.1
+    Vision_x_pid_param.kp=-0.05f;//0.1
     Vision_x_pid_param.ki=0;
-    Vision_x_pid_param.kd=0.08f;//0.08
+    Vision_x_pid_param.kd=0;//-0.08f;//0.08
     Vision_x_pid_param.outputMax = 15;//15
     Vision_x_pid_param.outputMin = -15;
     Vision_x_pid_param.differential_filterK =0.5f;
 
     // 前后（纵向偏差）
-    Vision_y_pid_param.kp=0.35f;//0.35
+    Vision_y_pid_param.kp=0;//-0.35f;//0.35
     Vision_y_pid_param.ki=0;
-    Vision_y_pid_param.kd=0.55f;//0.55
+    Vision_y_pid_param.kd=0;//-0.55f;//0.55
     Vision_y_pid_param.outputMax = 28;//25
     Vision_y_pid_param.outputMin = -28;
     Vision_y_pid_param.differential_filterK =0.5f;
@@ -318,7 +318,7 @@ void motor_task(void *pvParameters){
         get_encoder();
         pose_update_from_encoders();
         collision_guard_update();
-        Maixcam_SetTeam(2);
+        //Maixcam_SetTeam(2);
         if(bluetooth_work)
         {
             HC05_PollCommand();                     // 解析蓝牙命令（A/Z、调参、目标位置）   
@@ -327,8 +327,8 @@ void motor_task(void *pvParameters){
         if(++cnt==10)
         {
             //HC05_Printf("%d,%d\n",(int16_t)(motor_L0.measure),(int16_t)(motor_R0.measure));
-
-            HC05_Printf("%d,%d,%d\n",(int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),my_car.pose_manager.finished/*(int)(100*my_car.pose_manager.y)*/);
+            HC05_Printf("%d\n",(int)my_car.vision_manager.updated_ms);
+            //HC05_Printf("%d,%d,%d\n",(int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),my_car.pose_manager.finished/*(int)(100*my_car.pose_manager.y)*/);
             cnt =0;
         }
         if (collision_recover_step(HAL_GetTick())) {

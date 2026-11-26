@@ -97,6 +97,7 @@ void open_big_posture(void){
  * 夹爪（舵机1）不经过本任务，由 grab_posture/open_posture 直接写 CCR1 立即动作
  * ==========================================================================*/
 void rudder_task(void *pvParameters) {
+    //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t TASK_PERIOD = pdMS_TO_TICKS(10); // 10ms周期
     rudder_init();

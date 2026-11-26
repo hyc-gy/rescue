@@ -310,6 +310,8 @@ uint8_t Maixcam_IsFresh(uint32_t timeout_ms)
  * 利用空闲中断判断"一包数据收完"，然后按实际长度解析 */
 void maixcam_uart_irq_handler(void)
 {
+    //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+    
     if (__HAL_UART_GET_FLAG(&huart5, UART_FLAG_IDLE) != RESET) {
         __HAL_UART_CLEAR_IDLEFLAG(&huart5);
         HAL_UART_DMAStop(&huart5);                       // 暂停 DMA，保证数据不再变化

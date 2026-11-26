@@ -9,7 +9,7 @@
 #define HC05_TX_BUF_SIZE    256         // 发送缓冲：DMA 发送期间必须保持有效
 #define HC05_RX_DMA_SIZE    64          // DMA 接收缓冲大小
 #define HC05_FRAME_MAX      128         // 单帧最大长度（两次空闲中断之间的数据）
-#define HC05_RUN_SPEED      30.0f       // A 命令写入两个电机的目标速度（>0，按实车调）
+#define HC05_RUN_SPEED      22.0f       // A 命令写入两个电机的目标速度（>0，按实车调）
 
 /* 外部句柄声明 */
 extern osMessageQueueId_t hc05_rx_queue;

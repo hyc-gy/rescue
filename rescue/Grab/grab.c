@@ -62,6 +62,8 @@ static uint8_t yaw_full_circle = 0U;                       // 完整圈数
 static uint8_t SEARCH_angle_init = 0U;                     // 搜索角度是否已初始化
 static uint8_t lost_mode = 0U;                             // 目标丢失模式
 static uint8_t last_match = 0U;                            // 上一次匹配的目标类型
+static uint8_t ready_to_grab = 0U;                         // 是否已准备夹紧
+
 void calc_circle(float curr_yaw)
 {
     static float yaw_last = 0.0f;
@@ -247,8 +249,10 @@ void rescue_grab_task(void *pvParameters)
         {
         /* --- 等待队伍颜色：没设置就原地停着 --- */
         case RESCUE_GRAB_WAIT_TEAM:
-            motor_set_state(MOTOR_SEARCH_TARGET);
+            //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+            motor_set_state(MOTOR_STOP);
             if (configured_team == 1U || configured_team == 2U) {
+                //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
                 (void)Maixcam_SetTeam(configured_team);
                 Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
                 enter_state(RESCUE_GRAB_SEARCH);
@@ -257,6 +261,8 @@ void rescue_grab_task(void *pvParameters)
 
         /* --- 搜索：原地旋转，等待视觉给出可抓目标 --- */
         case RESCUE_GRAB_SEARCH:
+            //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+            grab_posture();
             if (SEARCH_angle_init == 0)
             {
                 set_vision_angle(ccr_2_max);
@@ -291,8 +297,10 @@ void rescue_grab_task(void *pvParameters)
             //     motor_set_state(MOTOR_STOP);
             //     break;
             // }
+            motor_set_state(MOTOR_SEARCH_TARGET);
             if (target_valid) {
                 motor_set_state(MOTOR_TRACK_TARGET);
+
                 /* 锁定当前看到的目标类型，进入"接近目标"状态 */
                 selected_type = my_car.vision_manager.target_type;
                 // if(selected_type == MAIXCAM_TARGET_PATIENT)
@@ -411,39 +419,49 @@ void rescue_grab_task(void *pvParameters)
             my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
             my_car.speed_manager.y_target = GRAB_APPROACH_Y;
             motor_set_state(MOTOR_TRACK_TARGET); // 视觉 x/y 双 PID 闭环前进
-            /* 到达抓取距离后停车夹紧，再进入独立的夹持确认状态。 */
-            if (my_car.vision_manager.y > 155 && rudder_cur_ccr[2] < ccr_2_min)
-            {
-                uint16_t new_target = rudder_cur_ccr[2] + 1;
-                if (new_target > ccr_2_min)
-                    new_target = ccr_2_min;
-                set_vision_angle(new_target);
-            }
-            // 开爪预动作：球进入水平中心区、y>85、舵机已压到 145° 以上 → 提前张爪
-            if (my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && my_car.vision_manager.y > 85 && rudder_cur_ccr[2] >= 145)
-            {
-                open_posture();
-            }
-            // 夹取判定（双重条件互印证：球在画面里"够近" 且 舵机确实"够低"）
-            // 条件A：y>170 且 舵机>=175
-            // 条件B：舵机>=190（到底） 且 y>160
-            if (my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && ((my_car.vision_manager.y > 170 && rudder_cur_ccr[2] >= 175) || (rudder_cur_ccr[2] >= 190 && my_car.vision_manager.y > 160)))
-            {                         // 185 170
-                motor_set_pwm(1, 50); // 慢速再蹭一小段，确保夹爪位置到位
-                motor_set_pwm(2, 50);
-                my_delay_ms(150);
-                grab_posture(); // 合爪
-                enter_state(RESCUE_GRAB_CONFIRM_CARGO);
-            }
-            // if (my_car.vision_manager.y >= GRAB_TARGET_NEAR_Y) {
-            //     motor_set_state(MOTOR_STOP);
+            // /* 到达抓取距离后停车夹紧，再进入独立的夹持确认状态。 */
+            // if (my_car.vision_manager.y > 155 && rudder_cur_ccr[2] < ccr_2_min)
+            // {
+            //     uint16_t new_target = rudder_cur_ccr[2] + 1;
+            //     if (new_target > ccr_2_min)
+            //         new_target = ccr_2_min;
+            //     set_vision_angle(new_target);
+            // }
+            // // 开爪预动作：球进入水平中心区、y>85、舵机已压到 145° 以上 → 提前张爪
+            // if (my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && my_car.vision_manager.y > 85 && rudder_cur_ccr[2] >= 145)
+            // {
             //     open_posture();
-
-            //     my_delay_ms(100);
-            //     grab_posture();
-            //     Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
+            // }
+            // // 夹取判定（双重条件互印证：球在画面里"够近" 且 舵机确实"够低"）
+            // // 条件A：y>170 且 舵机>=175
+            // // 条件B：舵机>=190（到底） 且 y>160
+            // if (my_car.vision_manager.x > 105 && my_car.vision_manager.x < 145 && ((my_car.vision_manager.y > 170 && rudder_cur_ccr[2] >= 175) || (rudder_cur_ccr[2] >= 190 && my_car.vision_manager.y > 160)))
+            // {                         // 185 170
+            //     motor_set_pwm(1, 50); // 慢速再蹭一小段，确保夹爪位置到位
+            //     motor_set_pwm(2, 50);
+            //     my_delay_ms(150);
+            //     grab_posture(); // 合爪
             //     enter_state(RESCUE_GRAB_CONFIRM_CARGO);
             // }
+            if (my_car.vision_manager.y >= 250) {
+                open_posture();
+                // uint16_t new_target = 170;
+                // set_vision_angle(new_target);
+                //my_delay_ms(100);
+                ready_to_grab = 1U;
+            }
+            if (my_car.vision_manager.y >= 290) {
+                uint16_t new_target = 180;
+                set_vision_angle(new_target);
+                my_delay_ms(100);
+            }
+            if(ready_to_grab && cargo_matches_selected_target() && TIM1->CCR2 == 180 && my_car.vision_manager.y >= 240)
+            {
+                ready_to_grab = 0U;
+                grab_posture();
+                Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
+                enter_state(RESCUE_GRAB_CONFIRM_CARGO);
+            }
             break;
 
         /* --- 夹持确认：只统计确认 ROI 的类别数，连续多帧正确才继续 --- */
