@@ -6,7 +6,7 @@
 #include "my_delay.h"
 #include "rudder_control.h"
 #include "hc05.h"
-
+#include "maixcam.h"
 
 typedef enum {
     MOTOR_STOP,           // 1. 停止模式    

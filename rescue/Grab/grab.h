@@ -22,7 +22,7 @@
 #define GRAB_VERIFY_TIMEOUT_MS          1500U   // 等待投放验证结果的最长时间
 
 /* 队伍默认值：1=蓝队，2=红队；填 0 表示不预设，等 Grab_SetTeam() 指定 */
-#define GRAB_TEAM_DEFAULT               0U
+#define GRAB_TEAM_DEFAULT               2U
 //场地坐标
 #if(initial_pose == 1)
 #define CENTER_Y -1.35f

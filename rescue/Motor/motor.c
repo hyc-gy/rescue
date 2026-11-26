@@ -100,8 +100,8 @@ void pid_init(void){
     Vision_y_pid_param.outputMin = -28;
     Vision_y_pid_param.differential_filterK =0.5f;
 
-    distance_pid_param.kp=10.0f;
-    distance_pid_param.ki=0;
+    distance_pid_param.kp=25.0f;
+    distance_pid_param.ki=1.0f;
     distance_pid_param.kd=0.0f;
     distance_pid_param.outputMax = 15;
     distance_pid_param.outputMin = -15;
@@ -109,14 +109,14 @@ void pid_init(void){
     
     yaw_pid_param.kp=0.45f;
     yaw_pid_param.ki=0.0f;
-    yaw_pid_param.kd=0.0f;
+    yaw_pid_param.kd=0.2f;
     yaw_pid_param.outputMax = 28;
     yaw_pid_param.outputMin = -28;
     yaw_pid_param.differential_filterK =0.5f;
 
     gyroT_pid_param.kp=0.45f;
     gyroT_pid_param.ki=0;
-    gyroT_pid_param.kd=0.0f;
+    gyroT_pid_param.kd=0.2f;
     gyroT_pid_param.outputMax = 28;
     gyroT_pid_param.outputMin = -28;
     gyroT_pid_param.differential_filterK =0.5f;
@@ -318,6 +318,7 @@ void motor_task(void *pvParameters){
         get_encoder();
         pose_update_from_encoders();
         collision_guard_update();
+        Maixcam_SetTeam(2);
         if(bluetooth_work)
         {
             HC05_PollCommand();                     // 解析蓝牙命令（A/Z、调参、目标位置）   
@@ -325,9 +326,9 @@ void motor_task(void *pvParameters){
         /* 碰撞恢复期间由 motor_task 独占电机，跳过正常控制 */
         if(++cnt==10)
         {
-            HC05_Printf("%d,%d\n",(int16_t)(motor_L0.measure),(int16_t)(motor_R0.measure));
+            //HC05_Printf("%d,%d\n",(int16_t)(motor_L0.measure),(int16_t)(motor_R0.measure));
 
-            //HC05_Printf("%d,%d,%d\n",(int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),(int)(100*my_car.pose_manager.y));
+            HC05_Printf("%d,%d,%d\n",(int)(my_car.angle_manager.yaw * 100),(int)(100*my_car.pose_manager.x),my_car.pose_manager.finished/*(int)(100*my_car.pose_manager.y)*/);
             cnt =0;
         }
         if (collision_recover_step(HAL_GetTick())) {
@@ -437,7 +438,7 @@ void motor_task(void *pvParameters){
                 {
                     distance_pid_obj.bias = 0;
                 }
-                if (distance_pid_obj.bias>=0 && distance_pid_obj.bias<=0.025)
+                if (distance_pid_obj.bias>=0 && distance_pid_obj.bias<=0.005)
                 {
                     gyroT_pid.bias = 0;
                     distance_pid_obj.bias = 0;

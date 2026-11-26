@@ -237,7 +237,7 @@ void rescue_grab_task(void *pvParameters)
         switch (grab_state) {
         /* --- 等待队伍颜色：没设置就原地停着 --- */
         case RESCUE_GRAB_WAIT_TEAM:
-            motor_set_state(MOTOR_STOP);
+            motor_set_state(MOTOR_SEARCH_TARGET);
             if (configured_team == 1U || configured_team == 2U) {
                 (void)Maixcam_SetTeam(configured_team);
                 Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
@@ -279,7 +279,7 @@ void rescue_grab_task(void *pvParameters)
             //     break;
             // }
             if (target_valid) {
-                motor_set_state(MOTOR_STOP);
+                motor_set_state(MOTOR_TRACK_TARGET);
                 /* 锁定当前看到的目标类型，进入"接近目标"状态 */
                 selected_type = my_car.vision_manager.target_type;
                 // if(selected_type == MAIXCAM_TARGET_PATIENT)

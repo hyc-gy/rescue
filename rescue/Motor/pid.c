@@ -88,6 +88,17 @@ float error_PID (struct P_pid_obj *obj, struct PID_param *pid)
 			obj->integral += obj->bias;
 		}
 	}
+	else if(pid == &distance_pid_param)
+	{
+		if (obj->bias>-0.1 && obj->bias<0.1)
+		{
+			obj->integral += obj->bias;
+		}
+		if (obj->bias>-0.005 && obj->bias<0.005)
+		{
+			return 0;
+		}
+	}
 	else{
 		if (obj->output >= pid->outputMax)
 		{
