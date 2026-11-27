@@ -52,7 +52,7 @@ import struct   # 协议帧的二进制打包/解包，统一使用网络字节�
 # 1) 可调参数
 # ============================================================================
 
-MODEL_PATH = "/root/models/rescue_2027/model_332145.mud"
+MODEL_PATH = "/root/models/rescue_2027/model_333351.mud"
 # 必须与模型内置标签顺序严格一致。语义由训练数据决定，颜色仅为初赛提示。
 # class_id 是模型标签下标；协议 type 使用下方 TYPE_BY_LABEL 的固定映射。
 LABELS = (
@@ -76,7 +76,6 @@ SEARCH_ROI = (0.0, 0.0, 1.0, 1.0)
 # 必须由业务流程等低头动作稳定并取得新画面后再确认，mode=9本身不代表舵机已到位。
 CONFIRM_ROI = (0.0, 0.0, 1.0, 1.0)
 SPLIT_CONFIRM_FRAMES = 10  # 切换前连续新画面均需通过区域包含检查
-SPLIT_LOST_MS = 500       # 仅跟随状态的本地计时；保持底盘速度需 STM32 配套
 LOG_INTERVAL_MS = 500     # MaixVision终端：状态变化立即输出，普通数据每500ms输出一次。
 VERSION = 3                                        # 协议版本，命令帧与结果帧必须一致
 # 结果帧正文格式：10 个 uint8 + 4 个 uint16 + 2 个 uint8，共 20 字节，大端。
@@ -120,11 +119,11 @@ class Mode:
 
 
 class NavigationAction:
-    """回基地识别的五种业务状态；字符串供本地使用，不是串口类型号。"""
+    """回基地识别的业务状态；字符串供本地使用，不是串口类型号。"""
 
     FOLLOW_ZONE = "FOLLOW_ZONE"                  # 跟随本帧可见的己方整体安全区。
     FOLLOW_SPLIT = "FOLLOW_SPLIT"                # 跟随本帧可见的己方分界线。
-    HOLD_LAST_SPEED = "HOLD_LAST_SPEED"          # 已跟线后短时漏检，请求按剩余时间保持速度。
+    HOLD_LAST_SPEED = "HOLD_LAST_SPEED"          # 保留旧接口名称；当前策略不再输出此状态。
     SEARCH_ZONE = "SEARCH_ZONE"                  # 没有可用参照，重新寻找己方整体安全区。
     NOT_RETURNING_TO_BASE = "NOT_RETURNING_TO_BASE"  # 非回基地阶段，不干涉其他任务。
 
@@ -293,7 +292,7 @@ class ZoneFollower:
     """己方整体安全区/分界线选择；模式5/6通过原24字节回传当前参照。
 
     每张新推理画面只调用一次 update。重新进入找区模式或更换队伍需 reset。
-    HOLD 只表示 500ms 内短暂漏检，不返回旧检测框冒充本帧结果，也不控制电机。
+    跟线时任一帧漏检立即清零，退回本帧整区或搜索；重新连续确认10帧才跟线。
     """
 
     def __init__(self):
@@ -302,7 +301,6 @@ class ZoneFollower:
     def reset(self):
         self.confirm_frames = 0
         self.following_split = False
-        self.last_split_ms = None
         self.state = "SEARCH"
 
     def update(self, objects, team, now_ms):
@@ -317,19 +315,14 @@ class ZoneFollower:
             # 已通过确认，不再依赖本帧整体安全区是否可见。
             split = max(splits, key=lambda o: o.score, default=None)
             if split is not None:
-                self.last_split_ms = now_ms
                 self.state = "SPLIT"
                 return split
-            if now_ms - self.last_split_ms < SPLIT_LOST_MS:
-                self.state = "HOLD"
-                return None
-            self.reset()  # 超时后从头进行包含检查和连续 10 帧确认
+            self.reset()  # 本帧漏检即清零；下方立即选择本帧整区，否则进入搜索。
         contained = [o for o in splits if any(center_in_box(o, z) for z in zones)]
         split = max(contained, key=lambda o: o.score, default=None)
         self.confirm_frames = self.confirm_frames + 1 if split is not None else 0
         if self.confirm_frames >= SPLIT_CONFIRM_FRAMES:
             self.following_split = True
-            self.last_split_ms = now_ms
             self.state = "SPLIT"
             return split
         self.state = "ZONE" if zone is not None else "SEARCH"
@@ -339,26 +332,22 @@ class ZoneFollower:
 def navigation_observation(follower, target, mode, team, now_ms):
     """导航业务结果，供界面及后续报文适配使用；不是新的串口帧定义。
 
-    purpose 保留物资/伤员的运输目的，action 只取 NavigationAction 的五种状态。
-    FOLLOW_ZONE/FOLLOW_SPLIT 携带当前参照框；HOLD_LAST_SPEED 只提供剩余
-    宽限时间，不拿旧框冒充新检测，也不代表底盘已经保持速度。
+    purpose 保留物资/伤员的运输目的。FOLLOW_ZONE/FOLLOW_SPLIT 携带本帧
+    参照框；分界线漏检立即退回整区或搜索，不输出HOLD_LAST_SPEED，不沿用旧框。
     SEARCH_ZONE 没有可用参照；NOT_RETURNING_TO_BASE 清空找区历史，
     只表示当前不执行找区逻辑，不要求底盘停车。队伍是进入回基地前的配置条件。
     """
     purpose = {Mode.MATERIAL_ZONE: "MATERIAL", Mode.PATIENT_ZONE: "PATIENT"}.get(mode)
     if purpose is None:
-        # 即使单独调用此函数，退出回基地时也不保留上一轮跟线和计时状态。
+        # 即使单独调用此函数，退出回基地时也不保留上一轮跟线和确认记录。
         follower.reset()
         action = NavigationAction.NOT_RETURNING_TO_BASE
     else:
         if team not in TEAM_ZONE_LABELS:
             raise ValueError("回基地前必须配置队伍：1=蓝方，2=红方")
         action = {"ZONE": NavigationAction.FOLLOW_ZONE, "SPLIT": NavigationAction.FOLLOW_SPLIT,
-                  "HOLD": NavigationAction.HOLD_LAST_SPEED, "SEARCH": NavigationAction.SEARCH_ZONE}[follower.state]
+                  "SEARCH": NavigationAction.SEARCH_ZONE}[follower.state]
     visible = target is not None and action in (NavigationAction.FOLLOW_ZONE, NavigationAction.FOLLOW_SPLIT)
-    hold_remaining = 0
-    if action == NavigationAction.HOLD_LAST_SPEED:
-        hold_remaining = max(0, SPLIT_LOST_MS - (now_ms - follower.last_split_ms))
     return {
         "mode": mode,
         "purpose": purpose,
@@ -370,7 +359,7 @@ def navigation_observation(follower, target, mode, team, now_ms):
                 if visible else None,
         "confidence": target.score if visible else 0.0,
         "confirm_frames": follower.confirm_frames if purpose is not None else 0,
-        "hold_remaining_ms": hold_remaining,
+        "hold_remaining_ms": 0,  # 保留回调字段兼容；已取消漏检保持，恒为0。
     }
 
 
@@ -507,7 +496,6 @@ LABEL_NAMES_CN = {
 NAVIGATION_NAMES_CN = {
     NavigationAction.FOLLOW_ZONE: "跟随整体安全区中心",
     NavigationAction.FOLLOW_SPLIT: "跟随分界线中心",
-    NavigationAction.HOLD_LAST_SPEED: "分界线暂时漏检，请求保持上一速度",
     NavigationAction.SEARCH_ZONE: "未找到可用参照，请求旋转寻找安全区",
     NavigationAction.NOT_RETURNING_TO_BASE: "非回基地阶段",
 }
@@ -525,9 +513,8 @@ def format_debug_status(mode, team, source, navigation, target, count, cargo_cou
     text = "[视觉状态] 队伍=%s；模式=%d（%s）；配置来源=%s\n当前=%s；目标=%s" % (
         TEAM_NAMES_CN[team], mode, MODE_NAMES_CN[mode], source, state, detail)
     if returning:
-        text += "\n分界线确认=%d/%d帧；漏检保持剩余=%d毫秒" % (
-            navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES, navigation["hold_remaining_ms"])
-        text += "\n当前参照坐标使用24字节结果帧；额外导航状态已交发送适配" if navigation_connected else "\n当前参照坐标使用24字节结果帧；保持/搜索状态尚未回传"
+        text += "\n分界线确认=%d/%d帧" % (navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES)
+        text += "\n当前参照坐标使用24字节结果帧；额外导航状态已交发送适配" if navigation_connected else "\n当前参照坐标使用24字节结果帧；搜索状态尚未回传"
     else:
         text += "；可选目标=%d" % count
     return text + "\n范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
@@ -618,7 +605,7 @@ def main(navigation_sender=None):
         active_roi = CONFIRM_ROI if mode == Mode.CONFIRM_CARGO else SEARCH_ROI
         if context is not None:
             target = zone_target
-            # 区域num为本帧当前参照类别的有效框数；无当前参照（含HOLD）时为0。
+            # 区域num为本帧当前参照类别的有效框数；无当前参照时为0。
             count = min(255, sum(1 for obj in objects
                                  if valid_detection(obj) and obj.class_id == target.class_id)) if target is not None else 0
         else:
@@ -699,8 +686,7 @@ def main(navigation_sender=None):
             frame.draw_string(0, 48, "Local:%s %d/%d" % (
                 zone_follower.state, zone_follower.confirm_frames, SPLIT_CONFIRM_FRAMES), color=image.COLOR_WHITE)
             frame.draw_string(0, 64, "Ref UART on; state adapter on" if navigation_sender is not None else "Ref UART on; state pending", color=image.COLOR_WHITE)
-            frame.draw_string(0, 80, "%s %dms" % (
-                navigation["action"], navigation["hold_remaining_ms"]), color=image.COLOR_WHITE)
+            frame.draw_string(0, 80, navigation["action"], color=image.COLOR_WHITE)
         screen.show(frame)
         # 主动让出 5ms，避免单核板子上纯 Python 循环把 CPU 占满
         time.sleep_ms(5)
