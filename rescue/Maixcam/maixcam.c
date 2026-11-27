@@ -89,7 +89,7 @@ static void maixcam_publish_result(const uint8_t *frame)
 
     /* 合法性检查：版本号 / 模式号 / 队伍 / 目标类型 / 置信度 / 有效性 全部要合理 */
     if (body[0] != MAIXCAM_PROTOCOL_VERSION ||
-        !maixcam_mode_valid(body[2]) || body[3] > 2U || type > MAIXCAM_TARGET_RED_PATIENT_ZONE ||
+        !maixcam_mode_valid(body[2]) || body[3] > 2U || type > MAIXCAM_TARGET_RED_ZONE_SPLIT ||
         body[18] > 100U || target_valid > 1U ||
         (target_valid && type == MAIXCAM_TARGET_NONE)) {
         return;

@@ -31,7 +31,8 @@ valid只表示本帧存在检测目标，不表示转运合法或已经送达。
 建议阶段：首次用mode=1；首次普通物资送达确认后用mode=7搜寻下一目标；
 选定物资后可用mode=8补充物资，选定伤员后用mode=3单独转运。
 物资按类别加权后的检测框面积选目标；模式9不选导航目标，独立回传三类数量合计。
-安全区/分界线的本地预览不复用旧半区类型号；配套STM32修改前不回传这些导航框。
+模式5/6通过原24字节回传己方当前整区或分界线参照，type=5蓝整区/6蓝线/7红整区/8红线。
+保持、搜索及剩余时间仍为本地导航状态，未加入原24字节；主控执行需另行配套。
 mode=7不允许物资与伤员混运；mode=8不自动限制载荷为三个。
 
 文件结构（从上到下）：
@@ -55,8 +56,8 @@ MODEL_PATH = "/root/models/rescue_2027/model_332145.mud"
 # 必须与模型内置标签顺序严格一致。语义由训练数据决定，颜色仅为初赛提示。
 # class_id 是模型标签下标；协议 type 使用下方 TYPE_BY_LABEL 的固定映射。
 LABELS = (
-    "HAZARD", "Blue_Zone", "Red_Zone", "Red_Zone_Split",
-    "Blue_Zone_Split", "CORE_MATERIAL", "PATIENT", "NORMAL_MATERIAL",
+    "Red_Zone", "Red_Zone_Split", "Blue_Zone_Split", "CORE_MATERIAL",
+    "PATIENT", "NORMAL_MATERIAL", "HAZARD", "Blue_Zone",
 )
 CONF_THRESHOLD = 0.50   # 检测、计数和预览共用门槛，包含等于 0.50 的框
 IOU_THRESHOLD = 0.45    # NMS 的 IoU 阈值：越大保留的重复框越多，越小删得越狠
@@ -97,10 +98,10 @@ class TargetType:
     CORE_MATERIAL = 2        # 核心物资（黑色正三棱锥）
     PATIENT = 3              # 伤员（橘色长方体）
     HAZARD = 4               # 危险物（浅蓝色正方体），永不作为搬运目标
-    BLUE_MATERIAL_ZONE = 5   # 蓝方物资区
-    BLUE_PATIENT_ZONE = 6    # 蓝方伤员区
-    RED_MATERIAL_ZONE = 7    # 红方物资区
-    RED_PATIENT_ZONE = 8     # 红方伤员区
+    BLUE_ZONE = 5        # 蓝色整体安全区
+    BLUE_ZONE_SPLIT = 6  # 蓝色分界线
+    RED_ZONE = 7         # 红色整体安全区
+    RED_ZONE_SPLIT = 8   # 红色分界线
 
 
 class Mode:
@@ -134,6 +135,10 @@ TYPE_BY_LABEL = {
     "CORE_MATERIAL": TargetType.CORE_MATERIAL,
     "PATIENT": TargetType.PATIENT,
     "NORMAL_MATERIAL": TargetType.NORMAL_MATERIAL,
+    "Blue_Zone": TargetType.BLUE_ZONE,
+    "Blue_Zone_Split": TargetType.BLUE_ZONE_SPLIT,
+    "Red_Zone": TargetType.RED_ZONE,
+    "Red_Zone_Split": TargetType.RED_ZONE_SPLIT,
 }
 # 选物优先级为检测框面积乘权重；浅蓝危险物在 allowed_types 中排除，不参与排序。
 MATERIAL_AREA_WEIGHTS = {
@@ -222,16 +227,16 @@ class CommandParser:
 # ============================================================================
 
 def allowed_types(mode, team):
-    """返回当前模式下允许作为导航目标的 TargetType 集合。
+    """返回物品筛选允许的类型；回基地参照由ZoneFollower单独选择。
 
-    危险物永远不会出现在返回值里；安全区只在对应模式且已配置队伍时才允许。
+    危险物不作为物品目标，模式5/6不经过物块区域过滤和面积权重排序。
     """
     # 确认模式只统计夹持区域，不输出导航目标
     if mode == Mode.CONFIRM_CARGO:
         return set()
     # 观察模式：所有目标都看，但排除危险物
     if mode == Mode.OBSERVE:
-        return set(TYPE_BY_LABEL.values()) - {TargetType.HAZARD}
+        return {TargetType.NORMAL_MATERIAL, TargetType.CORE_MATERIAL, TargetType.PATIENT}
     # 单一类别模式：type 号与 mode 号恰好一致，直接复用
     if mode in (Mode.NORMAL_MATERIAL, Mode.CORE_MATERIAL, Mode.PATIENT):
         return {mode}
@@ -241,15 +246,7 @@ def allowed_types(mode, team):
     # 混合物资：只允许普通物资 + 核心物资
     if mode == Mode.MIXED_MATERIALS:
         return {TargetType.NORMAL_MATERIAL, TargetType.CORE_MATERIAL}
-    # 以下为安全区模式：必须知道己方队伍颜色，否则无法判断哪个区是“己方”
-    if team not in (1, 2):
-        return set()  # 未选队伍时不猜测己方安全区。
-    if mode == Mode.MATERIAL_ZONE:
-        # 蓝队去蓝方物资区，红队去红方物资区
-        return {TargetType.BLUE_MATERIAL_ZONE if team == 1 else TargetType.RED_MATERIAL_ZONE}
-    if mode == Mode.PATIENT_ZONE:
-        # 蓝队去蓝方伤员区，红队去红方伤员区
-        return {TargetType.BLUE_PATIENT_ZONE if team == 1 else TargetType.RED_PATIENT_ZONE}
+    # 模式5/6由主循环使用ZoneFollower的己方参照，不在这里筛选区域。
     return set()
 
 
@@ -293,7 +290,7 @@ def center_in_box(obj, box):
 
 
 class ZoneFollower:
-    """本地安全区/分界线选择，用于预览和后续对接，不输出旧半区协议类型。
+    """己方整体安全区/分界线选择；模式5/6通过原24字节回传当前参照。
 
     每张新推理画面只调用一次 update。重新进入找区模式或更换队伍需 reset。
     HOLD 只表示 500ms 内短暂漏检，不返回旧检测框冒充本帧结果，也不控制电机。
@@ -530,7 +527,7 @@ def format_debug_status(mode, team, source, navigation, target, count, cargo_cou
     if returning:
         text += "\n分界线确认=%d/%d帧；漏检保持剩余=%d毫秒" % (
             navigation["confirm_frames"], SPLIT_CONFIRM_FRAMES, navigation["hold_remaining_ms"])
-        text += "；导航数据已交发送适配，接收执行待核对" if navigation_connected else "；导航发送适配未接入，仅本地判断"
+        text += "\n当前参照坐标使用24字节结果帧；额外导航状态已交发送适配" if navigation_connected else "\n当前参照坐标使用24字节结果帧；保持/搜索状态尚未回传"
     else:
         text += "；可选目标=%d" % count
     return text + "\n范围内数量：普通=%d，核心=%d，伤员=%d，危险=%d" % (
@@ -574,7 +571,7 @@ def main(navigation_sender=None):
     mode, team, sequence = INITIAL_MODE, INITIAL_TEAM, 0
     zone_follower = ZoneFollower()
     zone_context = None
-    print("[导航接口] " + ("已绑定发送适配，接收及执行仍需核对" if navigation_sender is not None else "尚未接入；原24字节物资结果正常发送，整区/分界线仅本地判断"), flush=True)
+    print("[导航接口] 当前整区/分界线参照使用24字节结果帧；" + ("额外导航状态已绑定发送适配，接收执行待核对" if navigation_sender is not None else "保持/搜索等额外状态未接入"), flush=True)
     config_source = "代码固定配置"
     last_log_key = None
     last_log_ms = 0
@@ -605,8 +602,8 @@ def main(navigation_sender=None):
         # 在绘图前推理，避免文字和检测框污染模型输入。
         objects = detector.detect(frame, conf_th=CONF_THRESHOLD, iou_th=IOU_THRESHOLD)
 
-        # 模式 5/6 仍是主控的旧回基地请求。新视觉选择先用于本地预览，
-        # 新区域/分界线 type 未与 STM32 同步前，不向它发送有歧义的导航框。
+        # 模式5/6保留物资/伤员的运输目的；type单独表示己方整区或分界线。
+        # 两种模式都先跟整体区，分界线连续确认10帧后切换；保持/搜索不伪造旧框。
         context = (mode, team) if mode in (Mode.MATERIAL_ZONE, Mode.PATIENT_ZONE) else None
         if context != zone_context:
             zone_follower.reset()
@@ -619,7 +616,13 @@ def main(navigation_sender=None):
 
         # --- 3) 按模式选择 ROI：确认模式只看夹具附近，其余模式看整个搜索区 ---
         active_roi = CONFIRM_ROI if mode == Mode.CONFIRM_CARGO else SEARCH_ROI
-        target, count = select_target(objects, mode, team, frame.width(), frame.height(), active_roi)
+        if context is not None:
+            target = zone_target
+            # 区域num为本帧当前参照类别的有效框数；无当前参照（含HOLD）时为0。
+            count = min(255, sum(1 for obj in objects
+                                 if valid_detection(obj) and obj.class_id == target.class_id)) if target is not None else 0
+        else:
+            target, count = select_target(objects, mode, team, frame.width(), frame.height(), active_roi)
         # 无论什么模式都统计三类物资和危险物，供 STM32 做安全/完成判断
         cargo_counts = count_types_in_roi(objects, frame.width(), frame.height(), active_roi,
                                          require_full_box=mode == Mode.CONFIRM_CARGO)
@@ -650,6 +653,18 @@ def main(navigation_sender=None):
                                           selected, count, cargo_counts, navigation_sender is not None)
             for line in summary.splitlines():
                 print(line, flush=True)
+            # 各模式逐框打印区域及四类物品；不依赖导航选择，沿用摘要节流。
+            for obj in objects:
+                if valid_detection(obj) and LABELS[obj.class_id] in (
+                        "Blue_Zone", "Red_Zone", "Blue_Zone_Split", "Red_Zone_Split"):
+                    print("[区域检测] %s；中心=(%.1f,%.1f)；宽高=(%.1f,%.1f)；置信度=%.2f" % (
+                        LABEL_NAMES_CN[LABELS[obj.class_id]], obj.x + obj.w / 2,
+                        obj.y + obj.h / 2, obj.w, obj.h, obj.score), flush=True)
+                elif valid_detection(obj) and TYPE_BY_LABEL.get(LABELS[obj.class_id]) in (
+                        TargetType.NORMAL_MATERIAL, TargetType.CORE_MATERIAL, TargetType.PATIENT, TargetType.HAZARD):
+                    print("[物块检测] %s；中心=(%.1f,%.1f)；宽高=(%.1f,%.1f)；置信度=%.2f" % (
+                        LABEL_NAMES_CN[LABELS[obj.class_id]], obj.x + obj.w / 2,
+                        obj.y + obj.h / 2, obj.w, obj.h, obj.score), flush=True)
             # 实际送入UART的报文；与视觉摘要共用节流，不逐帧刷屏。
             print("[UART] TX=%d err=%d write=%d/%d RX=%d CMD=%d seq=%d num=%d" % (
                 tx_attempts, tx_errors, written, len(packet), rx_bytes, accepted_commands, packet[3], packet[7]), flush=True)
@@ -683,7 +698,7 @@ def main(navigation_sender=None):
         if context is not None:
             frame.draw_string(0, 48, "Local:%s %d/%d" % (
                 zone_follower.state, zone_follower.confirm_frames, SPLIT_CONFIRM_FRAMES), color=image.COLOR_WHITE)
-            frame.draw_string(0, 64, "Nav adapter active" if navigation_sender is not None else "Nav adapter pending", color=image.COLOR_WHITE)
+            frame.draw_string(0, 64, "Ref UART on; state adapter on" if navigation_sender is not None else "Ref UART on; state pending", color=image.COLOR_WHITE)
             frame.draw_string(0, 80, "%s %dms" % (
                 navigation["action"], navigation["hold_remaining_ms"]), color=image.COLOR_WHITE)
         screen.show(frame)

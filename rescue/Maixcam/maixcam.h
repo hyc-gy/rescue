@@ -31,15 +31,15 @@ typedef enum {
     MAIXCAM_TARGET_CORE_MATERIAL = 2,         // 核心物资
     MAIXCAM_TARGET_PATIENT = 3,               // 伤员
     MAIXCAM_TARGET_HAZARD = 4,                // 危险物
-    /* 5—8只保留原V3四半区兼容，新整区/分界线使用下方MaixcamReference。 */
-    MAIXCAM_TARGET_BLUE_MATERIAL_ZONE = 5,    // 蓝方物资区
-    MAIXCAM_TARGET_BLUE_PATIENT_ZONE = 6,     // 蓝方伤员区
-    MAIXCAM_TARGET_RED_MATERIAL_ZONE = 7,     // 红方物资区
-    MAIXCAM_TARGET_RED_PATIENT_ZONE = 8       // 红方伤员区
+    /* 5—8按双方新约定表示实际参照，不再表示物资/伤员半区。 */
+    MAIXCAM_TARGET_BLUE_ZONE = 5,        // 蓝色整体安全区
+    MAIXCAM_TARGET_BLUE_ZONE_SPLIT = 6,  // 蓝色分界线
+    MAIXCAM_TARGET_RED_ZONE = 7,         // 红色整体安全区
+    MAIXCAM_TARGET_RED_ZONE_SPLIT = 8     // 红色分界线
 } MaixcamTargetType;
 
-/* 以下是业务数据定义，不规定新的串口帧格式。旧7/24字节协议保持不变。
- * 整区/分界线不再借用旧的四半区类型；新收发适配由双方确认后接入。 */
+/* 以下为完整导航业务定义；原24字节帧已用type=5—8携带当前参照框。
+ * 保持/搜索及剩余时间没有加入原帧，仍需双方另行对接状态发送与执行。 */
 typedef enum {
     MAIXCAM_NAV_NOT_RETURNING_TO_BASE = 0,
     MAIXCAM_NAV_FOLLOW_ZONE,
@@ -49,11 +49,12 @@ typedef enum {
 } MaixcamNavigationAction;
 
 typedef enum {
-    MAIXCAM_REFERENCE_NONE = 0,
-    MAIXCAM_REFERENCE_BLUE_ZONE,
-    MAIXCAM_REFERENCE_RED_ZONE,
-    MAIXCAM_REFERENCE_RED_SPLIT,
-    MAIXCAM_REFERENCE_BLUE_SPLIT
+    /* 内部参照沿用协议type值，避免将原来的1—4参照编号误当目标类型。 */
+    MAIXCAM_REFERENCE_NONE = MAIXCAM_TARGET_NONE,
+    MAIXCAM_REFERENCE_BLUE_ZONE = MAIXCAM_TARGET_BLUE_ZONE,
+    MAIXCAM_REFERENCE_BLUE_SPLIT = MAIXCAM_TARGET_BLUE_ZONE_SPLIT,
+    MAIXCAM_REFERENCE_RED_ZONE = MAIXCAM_TARGET_RED_ZONE,
+    MAIXCAM_REFERENCE_RED_SPLIT = MAIXCAM_TARGET_RED_ZONE_SPLIT
 } MaixcamReference;
 
 /* 原结果帧的一次完整快照。frame_id是本机接收代数，不是新增线上字段。 */
