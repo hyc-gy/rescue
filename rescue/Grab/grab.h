@@ -6,32 +6,37 @@
 #include "maixcam.h"
 #include "motor.h"
 #include "rudder_control.h"
+#include "car_task.h"
+#include "pid.h"
 
 /* ===== 调参区：下面这些图像坐标阈值和超时时间需要在实车上实测后调整 ===== */
 #define GRAB_TASK_PERIOD_MS             10U     // 任务周期（毫秒）
 #define GRAB_VISION_TIMEOUT_MS          150U    // 视觉数据超过此时间未更新就视为失效
-#define GRAB_IMAGE_CENTER_X             125U    // 期望目标位于画面横向中心的像素坐标
-#define GRAB_APPROACH_Y                 180U    // 接近目标时期望的纵向坐标（值越大表示越近）
+#define GRAB_IMAGE_CENTER_X             128U    // 期望目标位于画面横向中心的像素坐标
+#define GRAB_APPROACH_Y                 300U    // 接近目标时期望的纵向坐标（值越大表示越近）
 #define GRAB_TARGET_NEAR_Y              178U    // 目标 y 超过此值，认为已经贴得足够近
-#define GRAB_ZONE_APPROACH_Y            170U    // 接近投放区时期望的纵向坐标
+#define GRAB_ZONE_APPROACH_Y            251U    // 接近投放区时期望的纵向坐标
 #define GRAB_ZONE_NEAR_Y                160U    // 投放区 y 超过此值，认为已经到达投放位置
-#define GRAB_LOST_TARGET_TICKS          20U     // 目标连续丢失多少个周期后放弃（20×10ms=200ms）
+#define GRAB_LOST_TARGET_TICKS          30U     // 目标连续丢失多少个周期后放弃（30×10ms=300ms）
 #define GRAB_ZONE_SEARCH_TIMEOUT_MS     15000U  // 长时间找不到投放区时的超时时间
 #define GRAB_PUSH_DURATION_MS           700U    // 前推投放动作的持续时间
-#define GRAB_VERIFY_FRAMES              5U      // 需要连续确认的视觉帧数
+#define GRAB_VERIFY_FRAMES              15U      // 需要连续确认的视觉帧数
 #define GRAB_VERIFY_TIMEOUT_MS          1500U   // 等待投放验证结果的最长时间
 
+#define GRAB_PUSH_Y                 251U    // 推送黑色中线投放时望的纵向坐标
 /* 队伍默认值：1=蓝队，2=红队；填 0 表示不预设，等 Grab_SetTeam() 指定 */
-#define GRAB_TEAM_DEFAULT               2U
+#define GRAB_TEAM_DEFAULT               1U
 //场地坐标
 #if(initial_pose == 1)
-#define CENTER_Y -1.35f
+#define CENTER_Y -1.25f//-1.35
+#define INITIAL_YAW -45.0f//
 #else
-#define CENTER_Y 1.35f
+#define CENTER_Y 1.25f//1.35
+#define INITIAL_YAW 45.0f
 #endif
 #define PATIENT_ZONE_Y CENTER_Y+0.15f
 #define MATERIAL_ZONE_Y CENTER_Y-0.15f
-#define CENTER_X 1.35f
+#define CENTER_X 1.46f
 #define ZONE_X 0.45f
 
 

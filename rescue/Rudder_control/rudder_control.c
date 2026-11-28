@@ -19,8 +19,8 @@ TaskHandle_t rudder_handler;
 /* 记录舵机的当前 CCR 值。下标 1 对应舵机1（夹爪），下标 2 对应舵机2（云台） */
 uint16_t rudder_cur_ccr[3] = {0, 140, 135}; // 下标1、2对应舵机1、2
 uint16_t ccr_2_max = 135;//最高姿态
-uint16_t ccr_2_min = 192;//最低姿态
-uint16_t target_ccr_2 = 135;   // 舵机2的目标 CCR，由 set_vision_angle() 修改
+uint16_t ccr_2_min = 195;//最低姿态
+uint16_t target_ccr_2 = 150;   // 舵机2的目标 CCR，由 set_vision_angle() 修改//150：搜索物品角度；135：搜索区域角度
 
 /* 初始化：启动 TIM1 四路 PWM，并把两路舵机摆到初始位置 */
 void rudder_init(void){
@@ -28,8 +28,8 @@ void rudder_init(void){
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_3);
     HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_4);
-    rudder_cur_ccr[1] = 130;      // 夹爪初始：合拢
-    rudder_cur_ccr[2] = 135;     // 云台初始：抬到最高
+    rudder_cur_ccr[1] = 125;      // 夹爪初始：合拢
+    rudder_cur_ccr[2] = 150;     // 云台初始：抬到最高
     TIM1->CCR1 = rudder_cur_ccr[1];
     TIM1->CCR2 = rudder_cur_ccr[2];
 }

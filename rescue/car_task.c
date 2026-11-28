@@ -20,7 +20,7 @@ void user_init(void){
     collision_guard_init();
     HC05_Init();          // 蓝牙：创建接收队列 + 启动 DMA 接收 + 空闲中断
 }
-
+SemaphoreHandle_t pose_done_sem;
 TaskHandle_t Start_handler; //定义开始任务句柄
 void Start_task(void *pvParameters){
     taskENTER_CRITICAL();
@@ -65,5 +65,6 @@ void Start_task_create(void){
                 (void* )NULL,                  //传递给任务参数的指针参数
                 (UBaseType_t) Start_task_priority, //任务的优先级
                 (TaskHandle_t *)&Start_handler ); //任务句柄
+    pose_done_sem = xSemaphoreCreateBinary();
 }
 

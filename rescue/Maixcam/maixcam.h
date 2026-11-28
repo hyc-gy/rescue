@@ -17,10 +17,8 @@ typedef enum {
     MAIXCAM_MODE_NORMAL_MATERIAL = 1,    // 普通物资
     MAIXCAM_MODE_CORE_MATERIAL = 2,      // 核心物资
     MAIXCAM_MODE_PATIENT = 3,            // 伤员
-    MAIXCAM_MODE_MATERIAL_ZONE = 5,      // 物资区
-    MAIXCAM_MODE_PATIENT_ZONE = 6,       // 伤员区
-    MAIXCAM_MODE_RESCUE_TARGETS = 7,     // 救援目标（原"找球"）
-    MAIXCAM_MODE_MIXED_MATERIALS = 8,    // 混合物资
+    MAIXCAM_MODE_ZONE = 5,      // 安全区
+    MAIXCAM_MODE_RESCUE_TARGETS = 7,     // 救援目标
     MAIXCAM_MODE_CONFIRM_CARGO = 9       // 确认夹持物
 } MaixcamMode;
 

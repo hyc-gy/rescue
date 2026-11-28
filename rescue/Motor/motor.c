@@ -52,7 +52,9 @@ void encoder_init(void){
     HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL);
 }
-
+void set_vision_y_kp(float kp){
+    Vision_y_pid_param.kp = kp;
+}
 void motor_pid_clear(void){
     motor_L0 = (struct I_pid_obj){0,0,0,0,0,0};
     motor_R0 = (struct I_pid_obj){0,0,0,0,0,0};
@@ -64,13 +66,13 @@ void pid_init(void){
 
     MOTOR_PWM_MAX = (int32_t)(htim12.Instance->ARR * MAX_SPEED_rate);
     // 增量式 PID（电机内环），带抗积分饱和
-    L0_param.kp = 24;//57;//24;//60
-    L0_param.ki = 0.8;//5.0;//0.8f;//10
+    L0_param.kp = 57;//24;//60
+    L0_param.ki = 5.0;//0.8f;//10
     L0_param.kd = 0.12f;//5
     L0_param.outputMax = MOTOR_PWM_MAX;
 
-    R0_param.kp = 24;//57;//24;//60
-    R0_param.ki = 0.8;//5.0;//0.8f;//10
+    R0_param.kp = 57;//24;//60
+    R0_param.ki = 5.0;//0.8f;//10
     R0_param.kd = 0.12f;//5
     R0_param.outputMax = MOTOR_PWM_MAX;
 
@@ -85,17 +87,17 @@ void pid_init(void){
     R1_param.outputMax = MOTOR_PWM_MAX;
 
     // 左右（横向偏差）
-    Vision_x_pid_param.kp=-0.05f;//0.1
+    Vision_x_pid_param.kp=-0.04f;//0.1
     Vision_x_pid_param.ki=0;
-    Vision_x_pid_param.kd=0;//-0.08f;//0.08
+    Vision_x_pid_param.kd=-0.15;//-0.08f;//0.08
     Vision_x_pid_param.outputMax = 15;//15
     Vision_x_pid_param.outputMin = -15;
     Vision_x_pid_param.differential_filterK =0.5f;
 
     // 前后（纵向偏差）
-    Vision_y_pid_param.kp=0;//-0.35f;//0.35
+    Vision_y_pid_param.kp=0.12f;//近端p：0.05;//远端p：0.18;//0.35
     Vision_y_pid_param.ki=0;
-    Vision_y_pid_param.kd=0;//-0.55f;//0.55
+    Vision_y_pid_param.kd=0.55f;//0.55
     Vision_y_pid_param.outputMax = 28;//25
     Vision_y_pid_param.outputMin = -28;
     Vision_y_pid_param.differential_filterK =0.5f;

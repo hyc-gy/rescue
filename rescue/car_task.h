@@ -6,11 +6,10 @@
 #include "rudder_control.h"
 #include "motor.h"
 #include "sin_generate.h"
-#include "grab.h"
 #include "rudder_control.h"
 #include "gyro.h"
 #include "hc05.h"
-
+extern SemaphoreHandle_t pose_done_sem;
 extern TaskHandle_t Start_handler ; //定义开始任务句柄
 void Start_task(void *pvParameters);//声明任务函数
 #define Start_size  1024   //任务堆栈大小

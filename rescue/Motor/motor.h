@@ -27,6 +27,7 @@ void motor_pid_clear(void);
 void motor_set_pwm(uint8_t motor_idx, int32_t pid_out);
 void motor_set_state(MotorState state);
 void get_encoder(void);
+void set_vision_y_kp(float kp);
 
 extern TaskHandle_t motor_handler; 				// 电机任务句柄
 void motor_task(void *pvParameters);  			// 电机任务入口函数

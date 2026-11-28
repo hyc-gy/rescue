@@ -6,6 +6,7 @@
 #include "usart.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include "cmsis_os.h"
 #include <stdint.h>
 #include <string.h>

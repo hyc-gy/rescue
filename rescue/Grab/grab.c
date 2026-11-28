@@ -63,7 +63,9 @@ static uint8_t SEARCH_angle_init = 0U;                     // 搜索角度是否
 static uint8_t lost_mode = 0U;                             // 目标丢失模式
 static uint8_t last_match = 0U;                            // 上一次匹配的目标类型
 static uint8_t ready_to_grab = 0U;                         // 是否已准备夹紧
-
+static uint8_t is_near = 0U;                               // 是否已贴到跟前
+static uint8_t empty_ticks = 0U;                          // 是否已确认类别/数量
+static uint8_t pose_finished = 0U;                         // 是否已确认目标有效
 void calc_circle(float curr_yaw)
 {
     static float yaw_last = 0.0f;
@@ -100,6 +102,7 @@ static void enter_state(RescueGrabState state)
     SEARCH_angle_init = 0U; // 再次进入搜索时重新把云台抬到初始角度
     yaw_full_circle = 0U;
     yaw_total = 0.0f;
+    is_near = 0U;
 }
 
 /* 按目标类型取出视觉回传的对应数量（普通/核心/伤员） */
@@ -125,7 +128,7 @@ static uint8_t cargo_matches_selected_target(void)
     }
     if (my_car.vision_manager.target_num == 0U)
     {
-        return 0U;
+        return 4U;
     }
     if (first_normal_delivered == 0U)
     {
@@ -152,15 +155,6 @@ static uint8_t cargo_matches_selected_target(void)
     return 0U;
 }
 
-/* 目标类型 → 对应的投放区视觉模式（伤员送伤员区，其余送物资区） */
-static uint8_t zone_mode_for_type(uint8_t type)
-{
-    if (type == MAIXCAM_TARGET_PATIENT)
-    {
-        return MAIXCAM_MODE_PATIENT_ZONE;
-    }
-    return MAIXCAM_MODE_MATERIAL_ZONE;
-}
 
 /* 投放结果验证：确认目标确实被放进投放区 */
 static void verify_delivery(void)
@@ -255,6 +249,15 @@ void rescue_grab_task(void *pvParameters)
                 //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
                 (void)Maixcam_SetTeam(configured_team);
                 Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
+                // my_car.angle_manager.target_yaw = INITIAL_YAW;
+                // my_car.pose_manager.target_x = 0.0f;
+                // my_car.pose_manager.target_y = 0.0f;
+                // my_car.pose_manager.finished = 0;
+                // motor_set_state(MOTOR_POSITION);
+                // while (!my_car.pose_manager.finished);
+                // motor_set_state(MOTOR_FORWARD);
+                // my_delay_ms(2000);
+                motor_set_state(MOTOR_STOP);
                 enter_state(RESCUE_GRAB_SEARCH);
             }
             break;
@@ -262,6 +265,8 @@ void rescue_grab_task(void *pvParameters)
         /* --- 搜索：原地旋转，等待视觉给出可抓目标 --- */
         case RESCUE_GRAB_SEARCH:
             //HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+            uint16_t new_target = 150;
+            set_vision_angle(new_target);
             grab_posture();
             if (SEARCH_angle_init == 0)
             {
@@ -360,19 +365,20 @@ void rescue_grab_task(void *pvParameters)
                 break;
             case 2U:
                 my_car.pose_manager.target_x = ZONE_X;
-                my_car.pose_manager.target_y = PATIENT_ZONE_Y;
+                my_car.pose_manager.target_y = CENTER_Y;//PATIENT_ZONE_Y;
                 break;
             case 3U:
                 my_car.pose_manager.target_x = ZONE_X;
-                my_car.pose_manager.target_y = MATERIAL_ZONE_Y;
+                my_car.pose_manager.target_y = CENTER_Y;//MATERIAL_ZONE_Y;
                 break;
             default:
                 break;
             }
+            // xSemaphoreTake(pose_done_sem, 0);
             my_car.pose_manager.finished = 0;
             motor_set_state(MOTOR_POSITION);
-            while (my_car.pose_manager.finished == 0)
-                ;
+            // xSemaphoreTake(pose_done_sem, portMAX_DELAY);
+            while (my_car.pose_manager.finished == 0);
             if (my_car.pose_manager.finished)
             {
                 enter_state(RESCUE_GRAB_SEARCH);
@@ -410,14 +416,24 @@ void rescue_grab_task(void *pvParameters)
                 if (++lost_target_ticks >= GRAB_LOST_TARGET_TICKS)
                 { // 连续丢失超时 → 放弃
                     motor_set_state(MOTOR_STOP);
-                    Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
-                    enter_state(RESCUE_GRAB_SEARCH);
+                    // Set_Vision_Mode(MAIXCAM_MODE_RESCUE_TARGETS);
+                    // enter_state(RESCUE_GRAB_SEARCH);
+                    Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);//突然丢失，可能冲过头了
+                    enter_state(RESCUE_GRAB_CONFIRM_CARGO);
                 }
                 break;
             }
             lost_target_ticks = 0U; // 本帧看到目标，丢失计数清零
             my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
             my_car.speed_manager.y_target = GRAB_APPROACH_Y;
+            // if (is_near == 0U)
+            // {
+            //     set_vision_y_kp(0.23f);
+            // }
+            // else
+            // {
+            //     set_vision_y_kp(0.23f);
+            // }
             motor_set_state(MOTOR_TRACK_TARGET); // 视觉 x/y 双 PID 闭环前进
             // /* 到达抓取距离后停车夹紧，再进入独立的夹持确认状态。 */
             // if (my_car.vision_manager.y > 155 && rudder_cur_ccr[2] < ccr_2_min)
@@ -443,21 +459,25 @@ void rescue_grab_task(void *pvParameters)
             //     grab_posture(); // 合爪
             //     enter_state(RESCUE_GRAB_CONFIRM_CARGO);
             // }
-            if (my_car.vision_manager.y >= 250) {
+            if (my_car.vision_manager.y >= 260) {
                 open_posture();
-                // uint16_t new_target = 170;
-                // set_vision_angle(new_target);
+                //uint16_t new_target = 170;
+                //set_vision_angle(new_target);
                 //my_delay_ms(100);
                 ready_to_grab = 1U;
             }
-            if (my_car.vision_manager.y >= 290) {
-                uint16_t new_target = 180;
+            if (my_car.vision_manager.y >= 285) {
+                uint16_t new_target = 183;
+                // motor_set_state(MOTOR_STOP);
+                //set_vision_y_kp(0.05f);
+                is_near = 1U;
                 set_vision_angle(new_target);
-                my_delay_ms(100);
+                my_delay_ms(200);
             }
-            if(ready_to_grab && cargo_matches_selected_target() && TIM1->CCR2 == 180 && my_car.vision_manager.y >= 240)
+            if(ready_to_grab && cargo_matches_selected_target() && TIM1->CCR2 == 183 && my_car.vision_manager.y >= 258)
             {
                 ready_to_grab = 0U;
+                motor_set_state(MOTOR_STOP);
                 grab_posture();
                 Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
                 enter_state(RESCUE_GRAB_CONFIRM_CARGO);
@@ -466,10 +486,10 @@ void rescue_grab_task(void *pvParameters)
 
         /* --- 夹持确认：只统计确认 ROI 的类别数，连续多帧正确才继续 --- */
         case RESCUE_GRAB_CONFIRM_CARGO:
-            motor_set_state(MOTOR_STOP);
-            set_vision_angle(ccr_2_max);
-            my_delay_ms(500);
             grab_posture(); // 确认期间保持夹紧，避免物品掉落
+            motor_set_state(MOTOR_STOP);
+            set_vision_angle(195);
+            if(TIM1->CCR2 != 195) my_delay_ms(200);
             Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
             if (vision_fresh && my_car.vision_manager.target_mode == MAIXCAM_MODE_CONFIRM_CARGO &&
                 (!confirm_sequence_valid || my_car.vision_manager.sequence != confirm_last_sequence))
@@ -477,6 +497,16 @@ void rescue_grab_task(void *pvParameters)
                 confirm_last_sequence = my_car.vision_manager.sequence;
                 confirm_sequence_valid = 1U;
                 uint8_t cur_match = cargo_matches_selected_target();
+                if(cur_match == 4U)
+                {
+                    empty_ticks++;
+                    if(empty_ticks >= 10U)
+                    {
+                        enter_state(RESCUE_GRAB_SEARCH);
+                        empty_ticks = 0U;
+                    }
+                    break;
+                }
                 if (cur_match && last_match == cur_match)
                 {
                     cargo_confirm_ticks++;
@@ -505,7 +535,7 @@ void rescue_grab_task(void *pvParameters)
                 if (cargo_confirm_ticks >= GRAB_VERIFY_FRAMES)
                 {
                     cargo_confirm_ticks = 0U;
-                    Set_Vision_Mode(zone_mode_for_type(selected_type));
+                    //Set_Vision_Mode(MAIXCAM_MODE_ZONE);
                     enter_state(RESCUE_GRAB_APPROACH_ZONE);
                 }
             }
@@ -513,16 +543,20 @@ void rescue_grab_task(void *pvParameters)
 
         /* --- 接近投放区：先找到投放区，再闭环靠近 --- */
         case RESCUE_GRAB_APPROACH_ZONE:
+            set_vision_angle(135);
+            if(!pose_finished)
+            {
             my_car.pose_manager.finished = 0;
             my_car.angle_manager.target_yaw = 180;
             my_car.pose_manager.target_x = my_car.pose_manager.x;
             my_car.pose_manager.target_y = CENTER_Y;
             motor_set_state(MOTOR_POSITION);
-            while (my_car.pose_manager.finished == 0)
-                ;
-            set_vision_angle(ccr_2_max);
-            Set_Vision_Mode(zone_mode_for_type(selected_type));
-            if (!vision_fresh || my_car.vision_manager.target_mode != zone_mode_for_type(selected_type))
+            while (my_car.pose_manager.finished == 0);
+            pose_finished = 1U;
+            }
+
+            Set_Vision_Mode(MAIXCAM_MODE_ZONE);
+            if (!vision_fresh || my_car.vision_manager.target_mode != MAIXCAM_MODE_ZONE)
             {
                 motor_set_state(MOTOR_STOP);
                 break;
@@ -534,43 +568,56 @@ void rescue_grab_task(void *pvParameters)
                 if (yaw_full_circle >= 2U)
                 {
                     enter_state(RESCUE_GRAB_TARGET_LOST); // 先切状态（会清标志），再决定去向
-                    if (my_car.vision_manager.target_type == MAIXCAM_MODE_PATIENT_ZONE)
+                    if (selected_type == MAIXCAM_TARGET_PATIENT)
                         lost_mode = 2U;
-                    else if (my_car.vision_manager.target_type == MAIXCAM_MODE_MATERIAL_ZONE)
+                    else
                         lost_mode = 3U;
                 }
                 break;
             }
-            if (my_car.vision_manager.x < 105)
-            {
-                my_car.pose_manager.target_x = -1;
-                my_car.pose_manager.target_y = -1;
-                my_car.angle_manager.target_yaw = 90;
-                my_car.pose_manager.finished = 0;
-                motor_set_state(MOTOR_POSITION);
-                while (my_car.pose_manager.finished == 0)
-                    ;
-                my_car.angle_manager.target_yaw = 180;
-                break;
-            }
-            if (my_car.vision_manager.x > 145)
-            {
-                my_car.pose_manager.target_x = -1;
-                my_car.pose_manager.target_y = -1;
-                my_car.angle_manager.target_yaw = -90;
-                my_car.pose_manager.finished = 0;
-                motor_set_state(MOTOR_POSITION);
-                while (my_car.pose_manager.finished == 0)
-                    ;
-                my_car.angle_manager.target_yaw = 180;
-                break;
-            }
+            // if (my_car.vision_manager.x < 105)
+            // {
+            //     my_car.pose_manager.target_x = -1;
+            //     my_car.pose_manager.target_y = -1;
+            //     my_car.angle_manager.target_yaw = 90;
+            //     my_car.pose_manager.finished = 0;
+            //     motor_set_state(MOTOR_POSITION);
+            //     while (my_car.pose_manager.finished == 0);
+            //     my_car.angle_manager.target_yaw = 180;
+            //     break;
+            // }
+            // if (my_car.vision_manager.x > 145)
+            // {
+            //     my_car.pose_manager.target_x = -1;
+            //     my_car.pose_manager.target_y = -1;
+            //     my_car.angle_manager.target_yaw = -90;
+            //     my_car.pose_manager.finished = 0;
+            //     motor_set_state(MOTOR_POSITION);
+            //     while (my_car.pose_manager.finished == 0);
+            //     my_car.angle_manager.target_yaw = 180;
+            //     break;
+            // }
             my_car.speed_manager.x_target = GRAB_IMAGE_CENTER_X;
-            my_car.speed_manager.y_target = GRAB_ZONE_APPROACH_Y;
+            my_car.speed_manager.y_target = 260;
             motor_set_state(MOTOR_TRACK_TARGET); // 闭环靠近投放区
             /* 已经到达投放位置 → 准备预检 */
-            if (my_car.vision_manager.y >= GRAB_ZONE_NEAR_Y)
+            if (my_car.vision_manager.y >= GRAB_ZONE_APPROACH_Y)
             {
+                motor_set_state(MOTOR_STOP);
+                float cur_yaw = my_car.angle_manager.yaw;
+                if(cur_yaw < 135.0f && cur_yaw > -135.0f)
+                {
+                    my_car.angle_manager.target_yaw = 180;
+                    my_car.pose_manager.target_y = my_car.pose_manager.y - 0.3 * sinf(cur_yaw);
+                    my_car.pose_manager.target_x = my_car.pose_manager.x;
+                    my_car.pose_manager.finished = 0;
+                    motor_set_state(MOTOR_POSITION);
+                    while (my_car.pose_manager.finished == 0);
+                }
+                else
+                {
+                    my_car.pose_manager.target_y = CENTER_Y - 0.3 * sinf(cur_yaw);
+                }
                 motor_set_state(MOTOR_STOP);
                 // Set_Vision_Mode(MAIXCAM_MODE_CONFIRM_CARGO);
                 // enter_state(RESCUE_GRAB_PRECHECK);
@@ -579,7 +626,7 @@ void rescue_grab_task(void *pvParameters)
             break;
         /* --- 前推：一段固定时长的开环前进，把目标推进投放区 --- */
         case RESCUE_GRAB_PUSH:
-            if (selected_type == MAIXCAM_MODE_PATIENT_ZONE)
+            if (selected_type == MAIXCAM_MODE_PATIENT)
                 my_car.angle_manager.target_yaw = 150;
             else
             {

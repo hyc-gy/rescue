@@ -68,10 +68,8 @@ static uint8_t maixcam_mode_valid(uint8_t mode)
         case MAIXCAM_MODE_NORMAL_MATERIAL:
         case MAIXCAM_MODE_CORE_MATERIAL:
         case MAIXCAM_MODE_PATIENT:
-        case MAIXCAM_MODE_MATERIAL_ZONE:
-        case MAIXCAM_MODE_PATIENT_ZONE:
+        case MAIXCAM_MODE_ZONE:
         case MAIXCAM_MODE_RESCUE_TARGETS:
-        case MAIXCAM_MODE_MIXED_MATERIALS:
         case MAIXCAM_MODE_CONFIRM_CARGO:
             return 1U;
         default:
@@ -143,7 +141,7 @@ uint8_t Maixcam_PublishNavigation(const MaixcamNavigation *n)
     if ((n->team != 1U && n->team != 2U) || !maixcam_mode_valid(n->mode) ||
         n->action > MAIXCAM_NAV_SEARCH_ZONE || n->reference_visible > 1U ||
         n->confidence > 100U || n->hold_remaining_ms > 500U) return 0U;
-    uint8_t returning = n->mode == MAIXCAM_MODE_MATERIAL_ZONE || n->mode == MAIXCAM_MODE_PATIENT_ZONE;
+    uint8_t returning = n->mode == MAIXCAM_MODE_ZONE ;
     uint8_t visible = n->action == MAIXCAM_NAV_FOLLOW_ZONE || n->action == MAIXCAM_NAV_FOLLOW_SPLIT;
     if (returning) {
         if (n->action == MAIXCAM_NAV_NOT_RETURNING_TO_BASE) return 0U;
